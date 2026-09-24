@@ -12,9 +12,29 @@ fazla 15 mesaj. İzlenenler: ABD hisseleri + günün en çok yükselen / en akti
 listeleri (0,5-20 $, ön piyasa 11:00 TR'den itibaren), kripto (7/24), BIST (~15 dk gecikmeli).
 Alarm çıkınca Gemini o hisse için internette haber arar (anahtar varsa).
 
+## Sinyal filtreleri (`sinyal_filtreleri.py`)
+Alarm bulununca mesaj hemen gitmez; o hissenin 5 dakikalık mumlarıyla filtreden geçer. Geçemezse
+gönderilmez, nedeni log'a `ATLANDI XYZ: ...` diye yazılır. Kurallar:
+- Kırılım mumu hacimli olmalı (son 20 mumun 1,5 katı), kapanış kırılan seviyenin üstünde olmalı
+- Fiyat VWAP üstünde, ama VWAP'tan 2 ATR'den fazla uzaklaşmamış olmalı
+- Tepede hacimli doji olmamalı; risk %6'dan büyük olmamalı; TP1'den önce direnç olmamalı
+- Günlük RVOL: ABD ≥ 5x, BIST ≥ 3x (kripto'da uygulanmaz)
+
+Geçen sinyalde giriş / kademe / stop filtrenin seviyeleriyle yazılır (TP'ler riskin 1,5 / 2,5 / 4 katı).
+Haber: ABD hisselerinde `FINNHUB_KEY` varsa son 24 saatin başlığı (`📰 Haber yok (dikkat)` da olabilir),
+yoksa Gemini araştırır.
+
+**Çıkış takibi:** Gönderilen sinyal 6 saat izlenir (5 dk'da bir). Stop çalışırsa, sahte kırılım,
+hacimsiz yükseliş, hacimli doji, VWAP altı kapanış ya da büyük kırmızı mum olursa
+`🚪 $XYZ ÇIKIŞ: ...` mesajı gider. TP1 görülünce stop girişe çekilir, sonra iz süren stop.
+
+Ayarlar: `LIVE_FILTERS=0` (filtreleri kapatır, eski davranış) · `LIVE_RVOL_US` (5) · `LIVE_RVOL_BIST` (3) ·
+`LIVE_TRACK_HOURS` (6) · `LIVE_EXIT_CHECK_SEC` (300) · `LIVE_KASA` (ör. 1000 → adet önerisi).
+Eşikleri değiştirmek için `sinyal_filtreleri.py` başındaki sabitler düzenlenir.
+
 ## Kurulum
 1. Settings → Secrets and variables → Actions: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`,
-   isteğe bağlı `GEMINI_API_KEY`.
+   isteğe bağlı `GEMINI_API_KEY` ve `FINNHUB_KEY` (finnhub.io'dan ücretsiz).
 2. Settings → Actions → General → Workflow permissions: **Read and write permissions**.
 3. Actions sekmesinde workflow'ları etkinleştir. "Canlı alarm" bir kez başlayınca ~5 saat 40 dk
    çalışır ve bitince bir sonrakini kendisi başlatır (kesintisiz). Zincir koparsa yedek zamanlayıcı

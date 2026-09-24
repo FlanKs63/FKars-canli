@@ -79,12 +79,13 @@ def today_tr() -> date:
 def redact(text: str) -> str:
     """Hata mesajlarında bot token veya API anahtarı sızmasın."""
     out = str(text)
-    for name in ("TELEGRAM_BOT_TOKEN", "GEMINI_API_KEY"):
+    for name in ("TELEGRAM_BOT_TOKEN", "GEMINI_API_KEY", "FINNHUB_KEY"):
         secret = os.environ.get(name, "")
         if secret and len(secret) > 6:
             out = out.replace(secret, "***")
     out = re.sub(r"bot\d+:[A-Za-z0-9_-]{20,}", "bot***", out)
     out = re.sub(r"key=[A-Za-z0-9_-]{20,}", "key=***", out)
+    out = re.sub(r"token=[A-Za-z0-9_-]{10,}", "token=***", out)
     return out
 
 

@@ -45,6 +45,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
           LIVE_MARKETS: ${{ inputs.markets || 'us,kripto,bist' }}
           LIVE_MAX_MINUTES: ${{ inputs.minutes || '340' }}
         run: python live_alerts.py
