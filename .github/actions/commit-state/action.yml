@@ -1,0 +1,23 @@
+name: Durum dosyalarını kaydet
+description: state/ klasöründeki değişiklikleri commitler; başka bir çalışma araya girdiyse rebase edip tekrar dener.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        git config user.name "sinyal-bot"
+        git config user.email "sinyal-bot@users.noreply.github.com"
+        git add state/
+        if git diff --cached --quiet; then
+          echo "Durum değişmedi."
+          exit 0
+        fi
+        git commit -m "Durum güncellendi: ${GITHUB_WORKFLOW} $(date -u +'%Y-%m-%d %H:%M UTC')"
+        for i in 1 2 3; do
+          if git pull --rebase --quiet && git push --quiet; then
+            echo "Durum kaydedildi."
+            exit 0
+          fi
+          sleep $((i * 5))
+        done
+        echo "::warning::Durum dosyası kaydedilemedi; bir sonraki çalışmada aynı sinyal tekrar gelebilir."

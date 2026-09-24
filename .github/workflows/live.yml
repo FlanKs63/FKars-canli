@@ -1,0 +1,49 @@
+name: Canlı alarm
+
+# Her saat başı başlar, 55 dakika boyunca her 30 saniyede bir bakar; böylece kesintisiz çalışır.
+#
+# Bu repo Public olduğu için GitHub dakika sınırı yok.
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      markets:
+        description: "Piyasalar: us, kripto, bist"
+        default: "us,kripto,bist"
+      minutes:
+        description: "Kaç dakika çalışsın"
+        default: "55"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Canlı takip
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LIVE_MARKETS: ${{ inputs.markets || 'us,kripto,bist' }}
+          LIVE_MAX_MINUTES: ${{ inputs.minutes || '55' }}
+        run: python live_alerts.py
+
+      - if: always()
+        uses: ./.github/actions/commit-state
