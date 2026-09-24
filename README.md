@@ -16,8 +16,9 @@ Alarm çıkınca Gemini o hisse için internette haber arar (anahtar varsa).
 1. Settings → Secrets and variables → Actions: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`,
    isteğe bağlı `GEMINI_API_KEY`.
 2. Settings → Actions → General → Workflow permissions: **Read and write permissions**.
-3. Actions sekmesinde workflow'ları etkinleştir. "Canlı alarm" her saat başı kendiliğinden başlar
-   ve 55 dakika çalışır; elle başlatmak için **Run workflow**.
+3. Actions sekmesinde workflow'ları etkinleştir. "Canlı alarm" bir kez başlayınca ~5 saat 40 dk
+   çalışır ve bitince bir sonrakini kendisi başlatır (kesintisiz). Zincir koparsa yedek zamanlayıcı
+   (her saat :13 ve :43) yeniden başlatır. Hemen başlatmak için **Run workflow**.
 
 ## Ayarlar (workflow `env:` kısmına)
 `LIVE_MARKETS` (us,kripto,bist) · `LIVE_POLL_SECONDS` (30) · `LIVE_COOLDOWN_MIN` (45) ·

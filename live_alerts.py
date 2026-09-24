@@ -16,7 +16,7 @@ Piyasalar (LIVE_MARKETS):
 Alarm tetiklenince (GEMINI_API_KEY varsa) o hisse için tek seferlik haber araştırması yapılır.
 
 Ayarlar:
-  LIVE_MARKETS=us,kripto,bist   LIVE_POLL_SECONDS=30     LIVE_MAX_MINUTES=55 (0 = sonsuz)
+  LIVE_MARKETS=us,kripto,bist   LIVE_POLL_SECONDS=30     LIVE_MAX_MINUTES=340 (0 = sonsuz)
   LIVE_COOLDOWN_MIN=45          LIVE_REARM_PCT=0.05      LIVE_MAX_PER_HOUR=15
   LIVE_JUMP_PCT (hisse 0.03, kripto 0.02)   LIVE_VOLUME_MULT=5
   LIVE_MIN_PRICE=0.5  LIVE_MAX_PRICE=20   (yükselenler listesinden alınacak fiyat aralığı)
@@ -130,7 +130,7 @@ def main() -> None:
     require_telegram_env()
     markets = [m.strip() for m in env_str("LIVE_MARKETS", "us,kripto,bist").split(",") if m.strip()]
     poll = max(env_int("LIVE_POLL_SECONDS", 30), 10)
-    max_minutes = env_int("LIVE_MAX_MINUTES", 55)
+    max_minutes = env_int("LIVE_MAX_MINUTES", 340)
     cooldown = Cooldown(env_float("LIVE_COOLDOWN_MIN", 45), env_float("LIVE_REARM_PCT", 0.05),
                         env_int("LIVE_MAX_PER_HOUR", 15))
     state_path = common.STATE_DIR / "live.json"

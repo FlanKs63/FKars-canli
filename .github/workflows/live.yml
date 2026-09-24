@@ -1,11 +1,14 @@
 name: Canlı alarm
 
-# Her saat başı başlar, 55 dakika boyunca her 30 saniyede bir bakar; böylece kesintisiz çalışır.
+# Bir çalışma ~5 saat 40 dakika sürer ve bitince bir sonrakini kendisi başlatır (zincir).
+# GitHub'ın zamanlayıcısı saat başlarında çalışmaları sık sık atladığı için ona güvenmiyoruz;
+# cron sadece zincir koparsa (hata, iptal) botu yeniden ayağa kaldırmak için yedek olarak duruyor.
+# Aynı anda tek çalışma olur; yedek tetik, çalışan varken sıraya girip onun bitmesini bekler.
 #
 # Bu repo Public olduğu için GitHub dakika sınırı yok.
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "13,43 * * * *"
   workflow_dispatch:
     inputs:
       markets:
@@ -13,10 +16,11 @@ on:
         default: "us,kripto,bist"
       minutes:
         description: "Kaç dakika çalışsın"
-        default: "55"
+        default: "340"
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: ${{ github.workflow }}
@@ -25,7 +29,7 @@ concurrency:
 jobs:
   live:
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v5
 
@@ -42,8 +46,18 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           LIVE_MARKETS: ${{ inputs.markets || 'us,kripto,bist' }}
-          LIVE_MAX_MINUTES: ${{ inputs.minutes || '55' }}
+          LIVE_MAX_MINUTES: ${{ inputs.minutes || '340' }}
         run: python live_alerts.py
 
       - if: always()
         uses: ./.github/actions/commit-state
+
+      - name: Sonraki çalışmayı başlat
+        # Hata olursa zincir kopar (hızlı hata döngüsü olmasın); yedek cron 30 dk içinde yeniden başlatır.
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run live.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            -f markets="${{ inputs.markets || 'us,kripto,bist' }}" \
+            -f minutes="${{ inputs.minutes || '340' }}"
