@@ -18,6 +18,7 @@ runs:
             echo "Durum kaydedildi."
             exit 0
           fi
+          git rebase --abort 2>/dev/null || true
           sleep $((i * 5))
         done
         echo "::warning::Durum dosyası kaydedilemedi; bir sonraki çalışmada aynı sinyal tekrar gelebilir."

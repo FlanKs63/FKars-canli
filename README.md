@@ -44,7 +44,18 @@ Eşikleri değiştirmek için `sinyal_filtreleri.py` başındaki sabitler düzen
 - **📅 Takvim:** Her iş günü 09:00'da önümüzdeki 3 günün bilanço ve temettü (hak düşüm) tarihleri
   (ABD + BIST takip listesi). Olay yoksa mesaj gitmez. `TAKVIM=0` kapatır, `TAKVIM_HOUR`, `TAKVIM_DAYS`.
 - **🤖 Komutlar** (gruba yaz, ~30 sn içinde cevap gelir): `/durum` · `/fiyat THYAO` (ya da AAPL, BTC) ·
-  `/takvim` · `/yardim`. Sadece bu gruptan gelen komutlar işlenir. `TG_COMMANDS=0` kapatır.
+  `/takvim` · `/sonuc` · `/yardim`. Sadece bu gruptan gelen komutlar işlenir. `TG_COMMANDS=0` kapatır.
+
+## Güvenilirlik
+- **Tatiller:** BIST ve ABD tatilleri/yarım günleri tanımlı (`bot/tatil.py`); tatilde o piyasa taranmaz.
+  Yeni yılın bayram tarihleri `EXTRA_HOLIDAYS_BIST="2027-03-09,..."` ile koda dokunmadan eklenebilir.
+- **Bayat veri koruması:** son mum 5 dk'dan (BIST 25 dk) eskiyse alarm verilmez (dünün seansı / tatil).
+- **Durum kaydı:** `state/live.json` 20 dk'da bir GitHub'a kaydedilir (`LIVE_STATE_PUSH_MIN`).
+- Takvim arka planda hazırlanır (alarm döngüsü durmaz); Telegram hatası turu bozmaz.
+
+## Canlı sonuç raporu
+Kapanan her canlı sinyalin sonucu (çıkış ya da 6 saat dolması) kaydedilir. Her gün 23:30'da
+`⚡ CANLI ALARM — BUGÜNÜN SONUÇLARI` (kazanma oranı, ortalama, en iyi/kötü) gelir; `/sonuc` son 7 gün.
 
 ## Kurulum
 1. Settings → Secrets and variables → Actions: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`,

@@ -220,6 +220,12 @@ def run_main(bot_name: str, func) -> None:
 _gemini_client = None
 _gemini_calls = 0
 _gemini_off = False
+
+
+def reset_ai_budget() -> None:
+    """Uzun süren canlı döngüde MAX_AI_CALLS saatlik bütçe olsun (her saat sıfırlanır)."""
+    global _gemini_calls
+    _gemini_calls = 0
 _gemini_search_off = False
 
 

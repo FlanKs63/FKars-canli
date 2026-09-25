@@ -227,6 +227,7 @@ class OpenSignal:
     kirilan: float
     opened: str            # ISO zaman (UTC)
     tp1_hit: bool = False
+    exit_price: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -247,9 +248,23 @@ def expired(sig: OpenSignal, now: datetime) -> bool:
     return now - datetime.fromisoformat(sig.opened) > timedelta(hours=hours)
 
 
-def check_exit(sig: OpenSignal, df5: pd.DataFrame | None) -> str | None:
+def closed_bars(df5: pd.DataFrame, now: datetime | None, minutes: int = 5) -> pd.DataFrame:
+    """Henüz kapanmamış son mumu at (yfinance oluşmakta olan mumu da verir): yarım mumun hacmi
+    'hacim sönüyor' / VWAP altı gibi çıkış kurallarını haksız yere tetiklemesin."""
+    if now is None or not len(df5):
+        return df5
+    last = pd.Timestamp(df5.index[-1])
+    if last.tzinfo is None:
+        last = last.tz_localize("UTC")
+    return df5.iloc[:-1] if last + pd.Timedelta(minutes=minutes) > pd.Timestamp(now) else df5
+
+
+def check_exit(sig: OpenSignal, df5: pd.DataFrame | None, now: datetime | None = None) -> str | None:
     """Çıkış mesajı gerekiyorsa metni döndürür; gerekmiyorsa stop'u günceller ve None döner."""
-    if df5 is None or len(df5) < 5:
+    if df5 is None:
+        return None
+    df5 = closed_bars(df5, now)
+    if len(df5) < 5:
         return None
     opened = pd.Timestamp(sig.opened)
     idx = pd.DatetimeIndex(df5.index)
@@ -261,6 +276,7 @@ def check_exit(sig: OpenSignal, df5: pd.DataFrame | None) -> str | None:
     price = float(after["Close"].iloc[-1])
 
     def exit_text(reason: str, at: float) -> str:
+        sig.exit_price = at
         pct = (at / sig.entry - 1) * 100
         return with_footer([f"🚪 {sig.display} ÇIKIŞ: {reason}", "",
                             f"Giriş {fmt_price(sig.entry)} → {fmt_price(at)} (%{pct:+.1f})"])
@@ -277,3 +293,39 @@ def check_exit(sig: OpenSignal, df5: pd.DataFrame | None) -> str | None:
     if sig.tp1_hit:
         sig.stop = sf.iz_suren_stop(after, sig.stop)   # yalnız yukarı taşınır
     return None
+
+
+# -----------------------------------------------------------------------------
+# CANLI SONUÇ RAPORU
+# -----------------------------------------------------------------------------
+
+def record_result(results: list, sig: OpenSignal, now: datetime, price: float, reason: str) -> None:
+    """Kapanan canlı sinyalin sonucunu kaydeder (state/live.json → extra.results, 30 gün tutulur)."""
+    pct = (price / sig.entry - 1) if sig.entry else 0.0
+    results.append({"date": str(now.astimezone(TR).date()), "sym": sig.display, "market": sig.market,
+                    "pct": round(pct, 4), "reason": reason, "tp1": sig.tp1_hit})
+    cutoff = str((now - timedelta(days=30)).astimezone(TR).date())
+    results[:] = [r for r in results if r.get("date", "") >= cutoff]
+
+
+def results_summary(results: list, since: str, title: str) -> str | None:
+    rows = [r for r in results if r.get("date", "") >= since]
+    if not rows:
+        return None
+    pcts = [r["pct"] for r in rows]
+    wins = sum(1 for p in pcts if p > 0)
+    tp1 = sum(1 for r in rows if r.get("tp1"))
+    best = max(rows, key=lambda r: r["pct"])
+    worst = min(rows, key=lambda r: r["pct"])
+    lines = [title, "",
+             f"Kapanan sinyal: {len(rows)} · kârda kapanan: {wins} (%{wins / len(rows) * 100:.0f})",
+             f"TP1 görülen: {tp1} (%{tp1 / len(rows) * 100:.0f})",
+             f"Ortalama: %{sum(pcts) / len(pcts) * 100:+.1f}",
+             f"En iyi: {best['sym']} %{best['pct'] * 100:+.1f} · En kötü: {worst['sym']} %{worst['pct'] * 100:+.1f}"]
+    by_m: dict[str, list] = {}
+    for r in rows:
+        by_m.setdefault(r.get("market", "?"), []).append(r["pct"])
+    if len(by_m) > 1:
+        lines.append(" · ".join(f"{m}: {len(v)} sinyal, ort %{sum(v) / len(v) * 100:+.1f}" for m, v in sorted(by_m.items())))
+    return with_footer(lines)
+

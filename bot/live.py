@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from . import tatil
 from .common import env_float, with_footer
 from .signals import fmt_price
 
@@ -43,13 +44,46 @@ def market_open(market: str, now_utc: datetime) -> bool:
         return True
     if market == "us":
         ny = now_utc.astimezone(NY)
-        # ön piyasa 04:00 → kapanış sonrası 20:00 (ET): 1 dolarlık hisselerde hareket erken başlar
-        return ny.weekday() < 5 and dtime(4, 0) <= ny.time() < dtime(20, 0)
+        if not tatil.is_trading_day("us", ny.date()):
+            return False
+        # ön piyasa 04:00 → kapanış sonrası 20:00 (ET); yarım günde son piyasa 17:00'de biter
+        end = dtime(17, 0) if tatil.early_close("us", ny.date()) else dtime(20, 0)
+        return dtime(4, 0) <= ny.time() < end
     if market == "bist":
         tr = now_utc.astimezone(TR)
-        # Yahoo BIST verisi ~15 dk gecikmeli: kapanıştan sonra 20 dk daha bakılır
-        return tr.weekday() < 5 and dtime(10, 0) <= tr.time() < dtime(18, 30)
+        if not tatil.is_trading_day("bist", tr.date()):
+            return False
+        # Yahoo BIST verisi ~15 dk gecikmeli: açılıştan 15 dk sonra başla, kapanıştan 20 dk sonra bitir
+        half = tatil.early_close("bist", tr.date())
+        end = dtime(12, 50) if half else dtime(18, 30)
+        return dtime(10, 15) <= tr.time() < end
     return False
+
+
+# Son 1 dk mum bundan eskiyse veri bayat sayılır (dünün seansı, tatil, Yahoo gecikmesi) → alarm yok
+MAX_BAR_AGE_MIN = {"us": 5, "kripto": 5, "bist": 25}
+
+
+def is_fresh(df: pd.DataFrame | None, market: str, now_utc: datetime) -> bool:
+    if df is None or not len(df):
+        return False
+    last = pd.Timestamp(df.index[-1])
+    if last.tzinfo is None:
+        last = last.tz_localize("UTC")
+    age = (pd.Timestamp(now_utc) - last).total_seconds() / 60
+    return age <= MAX_BAR_AGE_MIN.get(market, 5)
+
+
+def session_part(df: pd.DataFrame, market: str) -> pd.DataFrame:
+    """Günlük değişim için bugünün mumları (kripto: son 24 saat)."""
+    idx = pd.DatetimeIndex(df.index)
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    if market == "kripto":
+        return df[idx >= idx[-1] - pd.Timedelta(hours=24)]
+    tz = NY if market == "us" else TR
+    local = idx.tz_convert(tz)
+    return df[[d.date() == local[-1].date() for d in local]]
 
 
 def detect(df: pd.DataFrame, symbol: str, display: str, market: str,
@@ -73,8 +107,10 @@ def detect(df: pd.DataFrame, symbol: str, display: str, market: str,
     vol_mult = vol5 / avg5 if avg5 > 0 else 0.0
     dollar5 = float((last5["Close"] * last5["Volume"].fillna(0)).sum())
     jump5 = price / float(close.iloc[-6]) - 1
-    day_change = price / float(df["Open"].iloc[0] if "Open" in df else close.iloc[0]) - 1
-    prior_high = float(df["High"].iloc[:-5].max())
+    today = session_part(df, market)
+    day_change = price / float(today["Open"].iloc[0] if "Open" in today else today["Close"].iloc[0]) - 1
+    prior = today.iloc[:-5] if len(today) > 5 else df.iloc[:-5]
+    prior_high = float(prior["High"].max())
     breakout = price > prior_high
 
     jump_pct = env_float("LIVE_JUMP_PCT", 0.02 if market == "kripto" else 0.03)

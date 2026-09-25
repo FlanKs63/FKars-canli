@@ -4,6 +4,7 @@
   /durum             bot çalışıyor mu, açık piyasalar, takip edilen sinyaller
   /fiyat THYAO       anlık fiyat ve günlük değişim (BIST, ABD, kripto: BTC, ETH …)
   /takvim            önümüzdeki günlerin bilanço / temettü takvimi
+  /sonuc             canlı alarmların son 7 gündeki sonucu (kazanma oranı, ortalama)
 
 Yalnız TELEGRAM_CHAT_ID'deki sohbetten gelen komutlar işlenir (başka yerden gelenler yok sayılır).
 getUpdates ile çekilir (webhook gerekmez); son okunan update_id state'te tutulur.
@@ -23,6 +24,7 @@ HELP = [
     "/durum — bot çalışıyor mu, takip edilen sinyaller",
     "/fiyat THYAO — anlık fiyat (BIST, ABD, BTC/ETH…)",
     "/takvim — bilanço / temettü takvimi",
+    "/sonuc — canlı alarmların son 7 gün sonucu",
     "/yardim — bu liste",
 ]
 
@@ -52,7 +54,7 @@ def parse_command(update: dict, chat_id: str) -> tuple[str, list[str]] | None:
         return None
     parts = text.split()
     cmd = parts[0][1:].split("@")[0].lower()
-    cmd = {"yardım": "yardim", "help": "yardim", "start": "yardim", "status": "durum", "price": "fiyat"}.get(cmd, cmd)
+    cmd = {"yardım": "yardim", "help": "yardim", "start": "yardim", "status": "durum", "price": "fiyat", "sonuç": "sonuc"}.get(cmd, cmd)
     return cmd, parts[1:]
 
 
@@ -63,8 +65,8 @@ def resolve_symbol(query: str, bist: set[str], crypto: dict[str, str]) -> tuple[
         return q, f"${q[:-3]}"
     if q in bist:
         return f"{q}.IS", f"${q}"
-    for sym, name in crypto.items():
-        if q in (sym, sym.split("-")[0]) or name.upper().startswith(q):
+    for sym, name in crypto.items():                  # tam eşleşme: 'ET' Ethereum'a gitmesin
+        if q in (sym, sym.split("-")[0]) or q == name.upper().split()[0]:
             return sym, name
     return q, f"${q}"
 

@@ -69,6 +69,34 @@ class TestDetect(unittest.TestCase):
         self.assertIn("15 dk gecikmeli", live.alert_message(a))
 
 
+class TestHolidaysAndFreshness(unittest.TestCase):
+    def test_holidays(self):
+        from datetime import date
+        from bot import tatil
+        self.assertTrue(tatil.is_holiday("bist", date(2026, 10, 29)))
+        self.assertTrue(tatil.is_holiday("us", date(2026, 11, 26)))
+        self.assertFalse(tatil.is_trading_day("bist", date(2026, 5, 27)))          # Kurban Bayramı
+        self.assertTrue(tatil.is_trading_day("kripto", date(2026, 10, 29)))
+        self.assertIsNotNone(tatil.early_close("bist", date(2026, 10, 28)))
+        t = lambda s: datetime.fromisoformat(s).replace(tzinfo=timezone.utc)  # noqa: E731
+        self.assertFalse(live.market_open("bist", t("2026-10-29T09:00")))          # Cumhuriyet Bayramı
+        self.assertFalse(live.market_open("us", t("2026-11-26T15:00")))            # Thanksgiving
+        self.assertFalse(live.market_open("bist", t("2026-10-28T10:30")))          # yarım gün 12:50'de bitti
+        with mock.patch.dict(os.environ, {"EXTRA_HOLIDAYS_BIST": "2026-09-24"}):
+            self.assertFalse(live.market_open("bist", t("2026-09-24T08:00")))
+
+    def test_stale_data_no_alert(self):
+        frames = {"XYZ": minute_bars(spike=True)}                 # 15:00 ET'de biten mumlar
+        send = mock.Mock()
+        later = datetime(2026, 9, 24, 19, 30, tzinfo=timezone.utc)   # 30 dk sonra → bayat
+        with mock.patch.object(live_alerts, "watchlist", return_value={"XYZ": "$XYZ"}), \
+                mock.patch.dict(os.environ, {"LIVE_FILTERS": "0"}):
+            n = live_alerts.run_once(["us"], live.Cooldown(45, 0.05, 15), {}, later,
+                                     fetch=mock.Mock(return_value=frames), send=send)
+        self.assertEqual(n, 0)
+        send.assert_not_called()
+
+
 class TestSessionsAndCooldown(unittest.TestCase):
     def test_market_open(self):
         t = lambda s: datetime.fromisoformat(s).replace(tzinfo=timezone.utc)  # noqa: E731
@@ -280,6 +308,12 @@ class TestExitTracking(unittest.TestCase):
         old = filtre.OpenSignal("A", "$A", "us", 1, 0.9, 1.1, 1, "2026-09-24T00:00:00+00:00")
         self.assertTrue(filtre.expired(old, datetime(2026, 9, 24, 7, 0, tzinfo=timezone.utc)))
 
+    def test_partial_bar_dropped(self):
+        df = five_min(price=10.0)
+        last = df.index[-1].tz_convert("UTC").to_pydatetime()
+        self.assertEqual(len(filtre.closed_bars(df, last + timedelta(minutes=2))), len(df) - 1)   # oluşuyor
+        self.assertEqual(len(filtre.closed_bars(df, last + timedelta(minutes=6))), len(df))       # kapandı
+
     def test_track_open_sends_and_removes(self):
         df = five_min(price=10.0)
         df.iloc[-2, df.columns.get_loc("Low")] = 8.5
@@ -292,6 +326,26 @@ class TestExitTracking(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertEqual(tracker, {})
         self.assertIn("ÇIKIŞ", send.call_args[0][0])
+
+    def test_results_recorded_and_summarized(self):
+        df = five_min(price=10.0)
+        df.iloc[-2, df.columns.get_loc("Low")] = 8.5
+        now = datetime(2026, 9, 24, 19, 5, tzinfo=timezone.utc)
+        sig = self._sig(df)
+        sig.opened = (now - timedelta(minutes=40)).isoformat()
+        old = self._sig(df, symbol="OLD", display="$OLD")
+        old.opened = (now - timedelta(hours=7)).isoformat()                    # takip süresi doldu
+        tracker, results = {"XYZ": sig, "OLD": old}, []
+        live_alerts.track_open(tracker, now, send=mock.Mock(),
+                               fetch5=mock.Mock(return_value={"XYZ": df, "OLD": df}), results=results)
+        self.assertEqual(tracker, {})
+        self.assertEqual({r["reason"] for r in results}, {"çıkış", "süre doldu"})
+        self.assertAlmostEqual([r for r in results if r["reason"] == "çıkış"][0]["pct"], -0.1, places=3)
+        text = filtre.results_summary(results, "2026-09-24", "⚡ TEST")
+        self.assertIn("Kapanan sinyal: 2", text)
+        self.assertIsNone(filtre.results_summary(results, "2026-09-30", "x"))
+        h = live_alerts.command_handlers(now, ["us"], {}, {"results": results})
+        self.assertIn("SON 7 GÜN", h["sonuc"]([]))
 
     def test_state_roundtrip_and_old_format(self):
         import tempfile
@@ -324,14 +378,14 @@ class TestKap(unittest.TestCase):
         return s
 
     def test_first_run_marks_seen_without_sending(self):
-        seen, send = [], mock.Mock()
+        seen, send = {}, mock.Mock()
         now = datetime(2026, 9, 25, 10, 20, tzinfo=timezone.utc)
         self.assertEqual(kap.check({"THYAO"}, seen, now, send, self._session(), first_run=True), 0)
         send.assert_not_called()
         self.assertEqual(len(seen), 3)
 
     def test_sends_only_important_watchlist(self):
-        seen, send = [], mock.Mock()
+        seen, send = {}, mock.Mock()
         now = datetime(2026, 9, 25, 10, 20, tzinfo=timezone.utc)
         n = kap.check({"THYAO"}, seen, now, send, self._session())
         self.assertEqual(n, 1)                                  # genel kurul ve listede olmayan şirket gitmez
@@ -339,6 +393,30 @@ class TestKap(unittest.TestCase):
         self.assertIn("📢 KAP · $THYAO", msg)
         self.assertIn("https://www.kap.org.tr/tr/Bildirim/101", msg)
         self.assertEqual(kap.check({"THYAO"}, seen, now, send, self._session()), 0)   # tekrar yok
+
+    def test_hourly_limit_is_real_and_overflow_not_lost(self):
+        now = datetime(2026, 9, 25, 10, 20, tzinfo=timezone.utc)
+        log = [(now - timedelta(minutes=m)).isoformat() for m in range(10)]       # son 1 saatte 10 mesaj
+        seen, send = {}, mock.Mock()
+        self.assertEqual(kap.check({"THYAO"}, seen, now, send, self._session(), sent_log=log), 0)
+        self.assertNotIn("101", seen)                          # sınır doldu → kaybolmadı, sonra gidecek
+        later = now + timedelta(minutes=61)
+        self.assertEqual(kap.check({"THYAO"}, seen, later, send, self._session(), sent_log=log), 1)
+
+    def test_fetch_window_covers_holiday_gap(self):
+        s = self._session()
+        now = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+        kap.check({"THYAO"}, {}, now, mock.Mock(), s, since="2026-05-26")          # bayram öncesi son kontrol
+        self.assertEqual(s.post.call_args.kwargs["json"]["fromDate"], "2026-05-26")
+        kap.check({"THYAO"}, {}, now, mock.Mock(), s, since="2026-01-01")          # en fazla 7 gün geri
+        self.assertEqual(s.post.call_args.kwargs["json"]["fromDate"], "2026-05-25")
+
+    def test_old_seen_pruned_by_date(self):
+        now = datetime(2026, 9, 25, 10, 20, tzinfo=timezone.utc)
+        seen = {"5": "2026-09-10", "101": "2026-09-25"}                      # 9 günden eski silinir
+        kap.check({"THYAO"}, seen, now, mock.Mock(), self._session())
+        self.assertNotIn("5", seen)
+        self.assertIn("101", seen)
 
 
 class TestTakvim(unittest.TestCase):
@@ -387,6 +465,32 @@ class TestKomutlar(unittest.TestCase):
                             {"yardim": lambda a: "liste"}, send)
         self.assertEqual(n, 1)
         self.assertEqual(komutlar.next_offset([self.upd(5, "x"), self.upd(9, "y")], 0), 10)
+
+    def test_fiyat_exact_match(self):
+        crypto = {"ETH-USD": "ETHEREUM ($)", "AVAX-USD": "AVALANCHE ($)"}
+        self.assertEqual(komutlar.resolve_symbol("et", set(), crypto), ("ET", "$ET"))      # Ethereum değil
+        self.assertEqual(komutlar.resolve_symbol("a", set(), crypto), ("A", "$A"))
+        self.assertEqual(komutlar.resolve_symbol("ethereum", set(), crypto), ("ETH-USD", "ETHEREUM ($)"))
+
+    def test_calendar_runs_in_background_and_caches(self):
+        import threading
+        gate = threading.Event()
+        job = live_alerts.CalendarJob(build=lambda now: (gate.wait(2), "📅 TAKVİM")[1])
+        tr = ZoneInfo("Europe/Istanbul")
+        now = datetime(2026, 9, 25, 9, 5, tzinfo=tr)
+        extra, send = {"tg_offset": 0}, mock.Mock()
+        with mock.patch.dict(os.environ, {"TG_COMMANDS": "0", "KAP_ALERTS": "0"}):
+            live_alerts.side_tasks(now, ["kripto"], {}, extra, send=send, job=job)
+            self.assertTrue(job.running())                        # döngü beklemedi
+            send.assert_not_called()
+            gate.set()
+            job.thread.join(2)
+            live_alerts.side_tasks(now, ["kripto"], {}, extra, send=send, job=job)
+        send.assert_called_once_with("📅 TAKVİM")
+        self.assertEqual(extra["takvim_date"], "2026-09-25")
+        self.assertEqual(extra["takvim_cache"]["msg"], "📅 TAKVİM")
+        handlers = live_alerts.command_handlers(now, ["kripto"], {}, extra)
+        self.assertEqual(handlers["takvim"]([]), "📅 TAKVİM")   # komut önbellekten, anında
 
     def test_side_tasks_commands_and_first_run(self):
         now = datetime(2026, 9, 26, 3, 0, tzinfo=timezone.utc)          # cumartesi gece: KAP/takvim yok
