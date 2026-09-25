@@ -24,6 +24,7 @@ import pandas as pd
 import sinyal_filtreleri as sf
 
 from .common import env_float, env_str, redact, with_footer
+from .live import buy_message
 from .market_data import _extract
 from .signals import fmt_price
 
@@ -166,20 +167,42 @@ def apply_policy(res: dict) -> dict:
     return out
 
 
+# Esnek kural metinlerinin mesajdaki kısa, anlaşılır karşılıkları
+SOFT_SHORT = (("günlük RVOL düşük", "günlük hacim zayıf"),
+              ("hacimsiz kırılım", "kırılım mumu hacimsiz"),
+              ("VWAP’tan", "fiyat çok koşmuş, geri çekilme bekle"),
+              ("TP1’den önce direnç", "TP1 öncesi direnç var"))
+
+# Giriş aralığı: fiyatın riskin 1/4'ü altı (kırılan seviyenin altına inmeden) ile riskin 0,15'i üstü.
+# Üst sınırın üstünde kovalanırsa TP1'in risk/ödülü 1:1'in altına düşer.
+ENTRY_BELOW_R, ENTRY_ABOVE_R = 0.25, 0.15
+
+
+def entry_zone(price: float, stop: float, kirilan: float | None = None) -> tuple[float, float]:
+    risk = max(price - stop, 0.0)
+    low = price - ENTRY_BELOW_R * risk
+    if kirilan and kirilan < price:
+        low = max(low, kirilan)
+    return low, price + ENTRY_ABOVE_R * risk
+
+
 def filtered_message(alert, res: dict, news_line: str = "") -> str:
-    """Eski giriş/kademe/stop satırları yerine filtrenin seviyeleri; başlık ve imza aynı."""
-    delay = " (15 dk gecikmeli veri)" if alert.delayed else ""
-    lines = [
-        f"⚡ {alert.display} ANİ HAREKET{delay}",
-        "",
-        f"Fiyat: {fmt_price(alert.price)} (son 5 dk %{alert.jump5 * 100:+.1f} · "
-        f"günlük %{alert.day_change * 100:+.1f})",
-        *[f"• {r}" for r in alert.reasons],
-        *res["mesaj_ek"].strip("\n").split("\n"),
-    ]
+    """Filtreden geçen sinyal için kısa AL mesajı (seviyeler filtreden)."""
+    stop, tps = float(res["stop"]), [float(t) for t in res["hedefler"]]
+    low, high = entry_zone(alert.price, stop, res.get("kirilan"))
+    soft = res.get("esnek") or []
+    notes = []
+    if soft:
+        short = [next((s for k, s in SOFT_SHORT if r.startswith(k)), r) for r in soft]
+        notes.append("⚠️ Dikkat: " + ", ".join(short))
     if news_line:
-        lines.append(news_line)
-    return with_footer(lines)
+        notes.append(news_line if len(news_line) <= 160 else news_line[:157].rstrip() + "…")
+    kasa = env_float("LIVE_KASA", 0)
+    if kasa and stop < alert.price:
+        adet, r = sf.pozisyon_buyuklugu(kasa, alert.price, stop)
+        notes.append(f"💰 {kasa:.0f}$ kasa: {adet} adet (stop olursa -{r:.0f}$)")
+    notes.append("💡 TP1'de 1/3 sat, stopu girişe çek")
+    return buy_message(alert, low, high, stop, tps, "ORTA" if soft else "GÜÇLÜ", notes)
 
 
 # -----------------------------------------------------------------------------
@@ -259,6 +282,14 @@ def closed_bars(df5: pd.DataFrame, now: datetime | None, minutes: int = 5) -> pd
     return df5.iloc[:-1] if last + pd.Timedelta(minutes=minutes) > pd.Timestamp(now) else df5
 
 
+# sinyal_filtreleri.cikis_uyarisi metni → (simge, ne yapılsın, kısa neden)
+EXIT_SHORT = (("Fiyat kırılan seviyenin altına döndü", "🔴", "SAT", "sahte kırılım"),
+              ("Yükseliş hacimsiz", "🟠", "YARISINI SAT", "hacim sönüyor"),
+              ("Hacimli doji", "🟠", "KÂR AL", "tepede hacimli doji"),
+              ("Mum VWAP altında", "🔴", "SAT", "VWAP altına indi"),
+              ("Büyük kırmızı mum", "🔴", "SAT", "büyük kırmızı mum"))
+
+
 def check_exit(sig: OpenSignal, df5: pd.DataFrame | None, now: datetime | None = None) -> str | None:
     """Çıkış mesajı gerekiyorsa metni döndürür; gerekmiyorsa stop'u günceller ve None döner."""
     if df5 is None:
@@ -278,11 +309,13 @@ def check_exit(sig: OpenSignal, df5: pd.DataFrame | None, now: datetime | None =
     def exit_text(reason: str, at: float) -> str:
         sig.exit_price = at
         pct = (at / sig.entry - 1) * 100
-        return with_footer([f"🚪 {sig.display} ÇIKIŞ: {reason}", "",
+        icon, action, why = next(((i, a, w) for k, i, a, w in EXIT_SHORT if reason.startswith(k)),
+                                 ("🔴", "SAT", reason))
+        return with_footer([f"{icon} {sig.display} {action} — {why}",
                             f"Giriş {fmt_price(sig.entry)} → {fmt_price(at)} (%{pct:+.1f})"])
 
     if float(after["Low"].min()) <= sig.stop:
-        label = "Stop çalıştı" if not sig.tp1_hit else "İz süren stop çalıştı (kâr korundu)"
+        label = "stop çalıştı" if not sig.tp1_hit else "iz süren stop çalıştı (kâr korundu)"
         return exit_text(label, sig.stop)
     if not sig.tp1_hit and float(after["High"].max()) >= sig.tp1:
         sig.tp1_hit = True

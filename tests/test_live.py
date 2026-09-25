@@ -62,11 +62,14 @@ class TestDetect(unittest.TestCase):
     def test_message(self):
         a = live.detect(minute_bars(spike=True), "XYZ", "$XYZ", "us", 50_000)
         msg = live.alert_message(a, news="Şirket yeni anlaşma duyurdu.")
-        self.assertTrue(msg.startswith("⚡ $XYZ ANİ HAREKET"))
-        for part in ("giriş bölgesi", "Kademeler:", "Stop:", "📰 Haber: Şirket", "(Furkanla Katla)"):
+        self.assertTrue(msg.startswith("🟢 $XYZ AL"))
+        for part in ("🔹 Giriş:", "🛑 Stop:", "🎯 Kademeler:", " → ", "⚡ Zirve kırıldı · hacim",
+                     "📰 Haber: Şirket", "(Furkanla Katla)"):
             self.assertIn(part, msg)
         a.delayed = True
         self.assertIn("15 dk gecikmeli", live.alert_message(a))
+        a.market = "bist"
+        self.assertIn("₺", live.alert_message(a))
 
 
 class TestHolidaysAndFreshness(unittest.TestCase):
@@ -217,9 +220,10 @@ class TestFilters(unittest.TestCase):
         n, send, tracker, _, _ = self._run(eval_result=ok, news="📰 Haber: Şirket FDA onayı aldı")
         self.assertEqual(n, 1)
         msg = send.call_args[0][0]
-        self.assertTrue(msg.startswith("⚡ $XYZ ANİ HAREKET"))
-        self.assertIn("Kademeler: 11.00 - 12.00 - 13.00", msg)
-        self.assertNotIn("giriş bölgesi", msg)                  # eski satırlar yok
+        self.assertTrue(msg.startswith("🟢 $XYZ AL · GÜÇLÜ"))
+        self.assertIn("🎯 Kademeler: 11.00$ → 12.00$ → 13.00$", msg)
+        self.assertNotIn("ANİ HAREKET", msg)                    # eski uzun biçim yok
+        self.assertNotIn("Plan:", msg)
         self.assertIn("📰 Haber: Şirket FDA onayı aldı", msg)
         self.assertIn("(Furkanla Katla)", msg)
         self.assertEqual(tracker["XYZ"].stop, 9.5)
@@ -250,6 +254,26 @@ class TestFilters(unittest.TestCase):
         self.assertFalse(filtre.apply_policy({"gonder": False, "neden": "yetersiz veri"})["gonder"])
         with mock.patch.dict(os.environ, {"LIVE_MAX_SOFT": "0"}):              # arkadaşın katı modu
             self.assertFalse(filtre.apply_policy({**base, "neden": "günlük RVOL düşük (2x < 5x)"})["gonder"])
+
+    def test_short_buy_message(self):
+        a = live.detect(minute_bars(spike=True), "XYZ", "$XYZ", "us", 50_000)
+        stop = a.price * 0.95
+        res = {"stop": stop, "hedefler": [a.price * k for k in (1.075, 1.125, 1.2)], "kirilan": a.prior_high,
+               "esnek": ["günlük RVOL düşük (1.0x < 5x)"]}
+        with mock.patch.dict(os.environ, {"LIVE_KASA": "1000"}):
+            msg = filtre.filtered_message(a, res, "📰 Haber: " + "uzun " * 60)
+        lines = msg.split("\n")
+        self.assertTrue(lines[0].startswith("🟡 $XYZ AL · ORTA"))
+        self.assertIn("⚠️ Dikkat: günlük hacim zayıf", msg)
+        self.assertIn("💰 1000$ kasa:", msg)
+        self.assertIn("🛑 Stop: ", msg)
+        self.assertIn("(%-5.0)", msg)
+        self.assertTrue(all(len(line) <= 160 for line in lines))           # uzun satır yok
+        low, high = filtre.entry_zone(a.price, stop, a.prior_high)
+        self.assertLessEqual(low, a.price)
+        self.assertGreater(high, a.price)
+        self.assertGreaterEqual(low, min(a.prior_high, a.price))            # kırılan seviyenin altına inmez
+        self.assertEqual(filtre.entry_zone(10.0, 9.0), (9.75, 10.15))
 
     def test_daily_rvol_and_prev_high(self):
         df = five_min()
@@ -287,8 +311,20 @@ class TestExitTracking(unittest.TestCase):
         df = five_min(price=10.0)
         df.iloc[-2, df.columns.get_loc("Low")] = 8.5
         msg = filtre.check_exit(self._sig(df), df)
-        self.assertIn("🚪 $XYZ ÇIKIŞ: Stop çalıştı", msg)
+        self.assertIn("🔴 $XYZ SAT — stop çalıştı", msg)
         self.assertIn("%-10.0", msg)
+
+    def test_exit_labels_short(self):
+        df = five_min(price=10.0)
+        for warn, head in (("Fiyat kırılan seviyenin altına döndü — sahte kırılım, stopu beklemeden çık.",
+                            "🔴 $XYZ SAT — sahte kırılım"),
+                           ("Yükseliş hacimsiz devam ediyor — pozisyonun yarısını azalt.",
+                            "🟠 $XYZ YARISINI SAT — hacim sönüyor"),
+                           ("Hacimli doji oluştu — kâr al / stopu yukarı çek.", "🟠 $XYZ KÂR AL — tepede hacimli doji")):
+            with mock.patch.object(filtre.sf, "cikis_uyarisi", return_value=warn):
+                msg = filtre.check_exit(self._sig(df, stop=1.0), df)
+            self.assertTrue(msg.startswith(head), msg)
+            self.assertIn("\nGiriş 10.00 → ", msg)
 
     def test_tp1_moves_stop_to_entry(self):
         df = five_min(price=10.0)
@@ -304,7 +340,7 @@ class TestExitTracking(unittest.TestCase):
         sig = self._sig(df, stop=1.0)
         with mock.patch.object(filtre.sf, "cikis_uyarisi", return_value="Mum VWAP altında kapandı — çıkış sinyali."):
             msg = filtre.check_exit(sig, df)
-        self.assertIn("ÇIKIŞ: Mum VWAP altında", msg)
+        self.assertIn("🔴 $XYZ SAT — VWAP altına indi", msg)
         old = filtre.OpenSignal("A", "$A", "us", 1, 0.9, 1.1, 1, "2026-09-24T00:00:00+00:00")
         self.assertTrue(filtre.expired(old, datetime(2026, 9, 24, 7, 0, tzinfo=timezone.utc)))
 
@@ -325,7 +361,7 @@ class TestExitTracking(unittest.TestCase):
         n = live_alerts.track_open(tracker, now, send=send, fetch5=mock.Mock(return_value={"XYZ": df}))
         self.assertEqual(n, 1)
         self.assertEqual(tracker, {})
-        self.assertIn("ÇIKIŞ", send.call_args[0][0])
+        self.assertIn("SAT —", send.call_args[0][0])
 
     def test_results_recorded_and_summarized(self):
         df = five_min(price=10.0)

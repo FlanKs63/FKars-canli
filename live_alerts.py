@@ -201,7 +201,7 @@ def run_once(markets: list[str], cooldown: Cooldown, movers: dict[str, str], now
 
 def track_open(tracker: dict, now: datetime, send=send_telegram, fetch5=None,
                results: list | None = None) -> int:
-    """Açık sinyallerde çıkış koşuluna bakar; çıkış olursa '🚪 ÇIKIŞ' mesajı gönderir.
+    """Açık sinyallerde çıkış koşuluna bakar; çıkış olursa '🔴 SAT' mesajı gönderir.
     Kapanan (çıkış ya da takip süresi dolan) her sinyalin sonucu results'a yazılır."""
     fetch5 = fetch5 or filtre.fetch_5m
     results = results if results is not None else []

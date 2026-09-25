@@ -23,15 +23,29 @@ gönderilmez, nedeni log'a `ATLANDI XYZ: ...` diye yazılır. Kurallar:
 **Zorunlu / esnek kurallar:** Kırılımın fitilde kalması, fiyatın VWAP altında olması, tepede hacimli doji,
 risk > %6 ya da 0,10 $ altı fiyat **zorunlu** kurallardır; biri bile bozulursa mesaj gitmez. Günlük RVOL,
 mum hacmi, VWAP'tan uzaklık ve TP1 önünde direnç **esnek** kurallardır: yalnız biri bozuksa sinyal
-`Sinyal: ORTA ⚠️ (neden)` etiketiyle gider, hepsi tamamsa `GÜÇLÜ ✅`. `LIVE_MAX_SOFT=0` → her kural zorunlu.
+`🟡 AL · ORTA` etiketiyle (altında `⚠️ Dikkat: ...`) gider, hepsi tamamsa `🟢 AL · GÜÇLÜ`. `LIVE_MAX_SOFT=0` → her kural zorunlu.
 
-Geçen sinyalde giriş / kademe / stop filtrenin seviyeleriyle yazılır (TP'ler riskin 1,5 / 2,5 / 4 katı).
+Geçen sinyal kısa bir **AL** mesajı olarak gider; giriş / kademe / stop filtrenin seviyeleridir
+(TP'ler riskin 1,5 / 2,5 / 4 katı). Giriş aralığı: fiyatın riskin 1/4'ü altı (kırılan seviyenin altına
+inmeden) ile 0,15'i üstü; üst sınırın üstünde alınırsa TP1'in risk/ödülü 1:1'in altına düşer.
+
+```
+🟢 $SRFM AL · GÜÇLÜ
+
+🔹 Giriş: 1.08 – 1.10$
+🛑 Stop: 1.03$ (%-5.0)
+🎯 Kademeler: 1.17$ → 1.23$ → 1.31$
+
+⚡ Zirve kırıldı · hacim 5.8x · 5 dk %+3.3 · gün %+19.8
+📰 Haber: ...
+💡 TP1'de 1/3 sat, stopu girişe çek
+```
 Haber: ABD hisselerinde `FINNHUB_KEY` varsa son 24 saatin başlığı (`📰 Haber yok (dikkat)` da olabilir),
 yoksa Gemini araştırır; Gemini kotası dolarsa Google Haberler'in son 24 saatlik başlıkları eklenir.
 
 **Çıkış takibi:** Gönderilen sinyal 6 saat izlenir (5 dk'da bir). Stop çalışırsa, sahte kırılım,
-hacimsiz yükseliş, hacimli doji, VWAP altı kapanış ya da büyük kırmızı mum olursa
-`🚪 $XYZ ÇIKIŞ: ...` mesajı gider. TP1 görülünce stop girişe çekilir, sonra iz süren stop.
+hacimsiz yükseliş, hacimli doji, VWAP altı kapanış ya da büyük kırmızı mum olursa kısa bir
+`🔴 $XYZ SAT — sahte kırılım` (hacim sönünce `🟠 YARISINI SAT`, dojide `🟠 KÂR AL`) mesajı gider. TP1 görülünce stop girişe çekilir, sonra iz süren stop.
 
 Ayarlar: `LIVE_FILTERS=0` (filtreleri kapatır, eski davranış) · `LIVE_MAX_SOFT` (1) · `LIVE_RVOL_US` (5) · `LIVE_RVOL_BIST` (3) ·
 `LIVE_TRACK_HOURS` (6) · `LIVE_EXIT_CHECK_SEC` (300) · `LIVE_KASA` (ör. 1000 → adet önerisi).

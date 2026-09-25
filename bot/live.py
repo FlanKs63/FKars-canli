@@ -142,22 +142,48 @@ def detect(df: pd.DataFrame, symbol: str, display: str, market: str,
     )
 
 
-def alert_message(a: Alert, news: str = "") -> str:
-    delay = " (15 dk gecikmeli veri)" if a.delayed else ""
+def money(x: float, market: str) -> str:
+    return f"{fmt_price(x)}{'₺' if market == 'bist' else '$'}"
+
+
+def why_line(a: Alert) -> str:
+    """Alarmın nedenleri tek satırda: '⚡ Zirve kırıldı · hacim 10.7x · 5 dk %+10.0 · gün %+19.8'."""
+    parts = []
+    if any(r.startswith("Gün içi zirve") for r in a.reasons):
+        parts.append("Zirve kırıldı")
+    if a.vol_mult >= 2:
+        parts.append(f"hacim {a.vol_mult:.1f}x")
+    parts += [f"5 dk %{a.jump5 * 100:+.1f}", f"gün %{a.day_change * 100:+.1f}"]
+    return "⚡ " + " · ".join(parts)
+
+
+def buy_message(a: Alert, entry_low: float, entry_high: float, stop: float, targets: list[float],
+                strength: str = "", notes: list[str] | tuple = ()) -> str:
+    """Kısa AL mesajı: başlık, giriş aralığı, stop, kademeler; altında tek satır neden + notlar.
+    strength: '' (filtresiz), 'GÜÇLÜ' ya da 'ORTA'."""
+    icon = "🟡" if strength == "ORTA" else "🟢"
+    tag = f" · {strength}" if strength else ""
+    delay = " (15 dk gecikmeli)" if a.delayed else ""
+    lo, hi = money(entry_low, a.market), money(entry_high, a.market)
+    entry = lo if lo == hi else f"{fmt_price(entry_low)} – {hi}"
+    risk = f" (%-{(a.price - stop) / a.price * 100:.1f})" if 0 < stop < a.price else ""
     lines = [
-        f"⚡ {a.display} ANİ HAREKET{delay}",
+        f"{icon} {a.display} AL{tag}{delay}",
         "",
-        f"Fiyat: {fmt_price(a.price)} (son 5 dk %{a.jump5 * 100:+.1f} · günlük %{a.day_change * 100:+.1f})",
-        *[f"• {r}" for r in a.reasons],
+        f"🔹 Giriş: {entry}",
+        f"🛑 Stop: {money(stop, a.market)}{risk}",
+        f"🎯 Kademeler: {' → '.join(money(t, a.market) for t in targets)}",
         "",
-        f"{fmt_price(a.entry_low)}-{fmt_price(a.entry_high)} giriş bölgesi",
-        f"Kademeler:{'-'.join(fmt_price(t) for t in a.targets)}++",
-        f"Stop:{fmt_price(a.stop)} altı",
-        f"📉 Risk: %{(a.price - a.stop) / a.price * 100:.1f} · 🎯 TP1 +%{(a.targets[0] / a.price - 1) * 100:.1f}",
+        why_line(a),
+        *[n for n in notes if n],
     ]
-    if news:
-        lines.append(f"📰 Haber: {news}")
     return with_footer(lines)
+
+
+def alert_message(a: Alert, news: str = "") -> str:
+    """Filtreler kapalıyken (LIVE_FILTERS=0) giden mesaj."""
+    return buy_message(a, a.entry_low, a.entry_high, a.stop, a.targets,
+                       notes=[f"📰 Haber: {news}" if news else ""])
 
 
 class Cooldown:
