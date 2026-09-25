@@ -38,7 +38,11 @@ from bot.common import (env_float, env_int, env_str, gemini_text, redact, requir
                         run_main, send_telegram)
 from bot.live import Cooldown, alert_message, detect, market_open
 from bot.market_data import _extract
-from bot.universe import BIST_STOCKS, CRYPTO, US_STOCKS
+from bot import kap, komutlar, takvim
+from bot.universe import BIST_STOCKS, CRYPTO, GYO, US_STOCKS
+from zoneinfo import ZoneInfo
+
+takvim_tz = ZoneInfo("Europe/Istanbul")
 
 BOT_NAME = "Canlı alarm"
 MIN_DOLLAR_5M = {"us": 50_000, "kripto": 100_000, "bist": 500_000}
@@ -102,7 +106,14 @@ def news_for(display: str, symbol: str) -> str:
     prompt = (f"{display.lstrip('$')} ({symbol}) şu an sert yükseliyor. Son 24 saatteki haberleri, "
               "şirket açıklamalarını internette ara; yükselişin olası sebebini Türkçe en fazla 2 kısa "
               "cümleyle yaz. Haber yoksa sadece 'Belirgin bir haber yok.' yaz.")
-    return gemini_text(prompt, max_chars=260, search=True)
+    text = gemini_text(prompt, max_chars=260, search=True)
+    if text or env_str("GOOGLE_NEWS", "1") == "0":
+        return text
+    from bot import google_news                       # Gemini kotası doldu / anahtar yok → Google Haberler
+    code = symbol.removesuffix(".IS").removesuffix("-USD")
+    query, lang = (f"{code} hisse", "tr") if symbol.endswith(".IS") else \
+        ((display.lstrip("$"), "tr") if symbol.endswith("-USD") else (f"{code} stock", "en"))
+    return google_news.summary(query, lang=lang, max_age_hours=24, max_chars=260)
 
 
 def _news_line(alert, sym: str, now: datetime, news_budget: list[int] | None) -> str:
@@ -187,6 +198,15 @@ def track_open(tracker: dict, now: datetime, send=send_telegram, fetch5=None) ->
     return exits
 
 
+def load_extra(path) -> dict:
+    """KAP'ta görülen bildirimler, Telegram update ofseti, takvimin son gönderildiği gün."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except ValueError:
+        return {}
+    return (data.get("extra") or {}) if isinstance(data, dict) else {}
+
+
 def load_state(path) -> tuple[dict, dict]:
     """state/live.json → (cooldown sözlüğü, açık sinyaller). Eski biçim (yalnız cooldown) de okunur."""
     if not path.exists():
@@ -206,10 +226,62 @@ def load_state(path) -> tuple[dict, dict]:
     return data if isinstance(data, dict) else {}, {}
 
 
-def save_state(path, cooldown: Cooldown, tracker: dict) -> None:
+def save_state(path, cooldown: Cooldown, tracker: dict, extra: dict | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = {"cooldown": cooldown.to_dict(), "open": {s: sig.to_dict() for s, sig in tracker.items()}}
+    data = {"cooldown": cooldown.to_dict(), "open": {s: sig.to_dict() for s, sig in tracker.items()},
+            "extra": extra or {}}
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def calendar_symbols() -> tuple[dict[str, str], set[str]]:
+    syms = {s: f"${s}" for s in US_STOCKS}
+    syms.update({f"{s}.IS": f"${s}" for s in list(BIST_STOCKS) + list(GYO)})
+    return syms, set(US_STOCKS)
+
+
+def calendar_message(now: datetime) -> str | None:
+    syms, us_watch = calendar_symbols()
+    today = now.astimezone(takvim_tz).date()
+    return takvim.message(takvim.collect(syms, today, days=env_int("TAKVIM_DAYS", 3), us_watch=us_watch), today)
+
+
+def command_handlers(now: datetime, markets: list[str], tracker: dict) -> dict:
+    def fiyat(args):
+        if not args:
+            return "Kullanım: /fiyat THYAO  (ya da /fiyat AAPL, /fiyat BTC)"
+        sym, disp = komutlar.resolve_symbol(args[0], set(BIST_STOCKS) | set(GYO), dict(CRYPTO))
+        return komutlar.price_text(sym, disp)
+    return {
+        "yardim": lambda args: "\n".join(komutlar.HELP),
+        "durum": lambda args: komutlar.status_text(now, markets, market_open, tracker),
+        "fiyat": fiyat,
+        "takvim": lambda args: calendar_message(now) or "📅 Önümüzdeki günlerde takip listesinde bilanço/temettü yok.",
+    }
+
+
+def side_tasks(now: datetime, markets: list[str], tracker: dict, extra: dict, send=send_telegram) -> None:
+    """Alarm turu dışındaki işler: Telegram komutları, KAP bildirimleri, günlük takvim."""
+    mono = time.monotonic()
+    if env_str("TG_COMMANDS", "1") != "0":
+        offset = int(extra.get("tg_offset") or 0)
+        updates = komutlar.get_updates(offset)
+        if offset:                                     # ilk açılışta eski komutlara cevap verme
+            komutlar.handle(updates, env_str("TELEGRAM_CHAT_ID"), command_handlers(now, markets, tracker), send)
+        extra["tg_offset"] = komutlar.next_offset(updates, offset) or offset or 1
+    now_tr = now.astimezone(takvim_tz)
+    if (env_str("KAP_ALERTS", "1") != "0" and now_tr.weekday() < 5 and 7 <= now_tr.hour <= 23
+            and mono - _timers.get("kap", -1e9) >= max(env_int("KAP_POLL_SEC", 120), 60)):
+        _timers["kap"] = mono
+        seen = extra.setdefault("kap_seen", [])
+        kap.check(set(BIST_STOCKS) | set(GYO), seen, now_tr, send, first_run=not seen)
+    if takvim.due(now_tr, extra.get("takvim_date")):
+        extra["takvim_date"] = str(now_tr.date())
+        msg = calendar_message(now)
+        if msg:
+            send(msg)
+
+
+_timers: dict[str, float] = {}
 
 
 def main() -> None:
@@ -221,6 +293,7 @@ def main() -> None:
                         env_int("LIVE_MAX_PER_HOUR", 15))
     state_path = common.STATE_DIR / "live.json"
     saved_cooldown, tracker = load_state(state_path)
+    extra = load_extra(state_path)
     cooldown.load(saved_cooldown)
     rejected: dict = {}
     exit_every = max(env_int("LIVE_EXIT_CHECK_SEC", 300), 60)
@@ -251,7 +324,11 @@ def main() -> None:
                 track_open(tracker, now)
             except Exception as e:  # noqa: BLE001
                 print(redact(f"  Takip hatası: {e}"))
-        save_state(state_path, cooldown, tracker)
+        try:
+            side_tasks(now, markets, tracker, extra)
+        except Exception as e:  # noqa: BLE001
+            print(redact(f"  Yan görev hatası: {e}"))
+        save_state(state_path, cooldown, tracker, extra)
         if max_minutes and (time.monotonic() - start) / 60 >= max_minutes:
             print("Süre doldu, çıkılıyor (bir sonraki çalışma devam edecek).")
             break

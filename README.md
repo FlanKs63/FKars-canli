@@ -20,17 +20,31 @@ gönderilmez, nedeni log'a `ATLANDI XYZ: ...` diye yazılır. Kurallar:
 - Tepede hacimli doji olmamalı; risk %6'dan büyük olmamalı; TP1'den önce direnç olmamalı
 - Günlük RVOL: ABD ≥ 5x, BIST ≥ 3x (kripto'da uygulanmaz)
 
+**Zorunlu / esnek kurallar:** Kırılımın fitilde kalması, fiyatın VWAP altında olması, tepede hacimli doji,
+risk > %6 ya da 0,10 $ altı fiyat **zorunlu** kurallardır; biri bile bozulursa mesaj gitmez. Günlük RVOL,
+mum hacmi, VWAP'tan uzaklık ve TP1 önünde direnç **esnek** kurallardır: yalnız biri bozuksa sinyal
+`Sinyal: ORTA ⚠️ (neden)` etiketiyle gider, hepsi tamamsa `GÜÇLÜ ✅`. `LIVE_MAX_SOFT=0` → her kural zorunlu.
+
 Geçen sinyalde giriş / kademe / stop filtrenin seviyeleriyle yazılır (TP'ler riskin 1,5 / 2,5 / 4 katı).
 Haber: ABD hisselerinde `FINNHUB_KEY` varsa son 24 saatin başlığı (`📰 Haber yok (dikkat)` da olabilir),
-yoksa Gemini araştırır.
+yoksa Gemini araştırır; Gemini kotası dolarsa Google Haberler'in son 24 saatlik başlıkları eklenir.
 
 **Çıkış takibi:** Gönderilen sinyal 6 saat izlenir (5 dk'da bir). Stop çalışırsa, sahte kırılım,
 hacimsiz yükseliş, hacimli doji, VWAP altı kapanış ya da büyük kırmızı mum olursa
 `🚪 $XYZ ÇIKIŞ: ...` mesajı gider. TP1 görülünce stop girişe çekilir, sonra iz süren stop.
 
-Ayarlar: `LIVE_FILTERS=0` (filtreleri kapatır, eski davranış) · `LIVE_RVOL_US` (5) · `LIVE_RVOL_BIST` (3) ·
+Ayarlar: `LIVE_FILTERS=0` (filtreleri kapatır, eski davranış) · `LIVE_MAX_SOFT` (1) · `LIVE_RVOL_US` (5) · `LIVE_RVOL_BIST` (3) ·
 `LIVE_TRACK_HOURS` (6) · `LIVE_EXIT_CHECK_SEC` (300) · `LIVE_KASA` (ör. 1000 → adet önerisi).
 Eşikleri değiştirmek için `sinyal_filtreleri.py` başındaki sabitler düzenlenir.
+
+## KAP bildirimleri, takvim ve Telegram komutları
+- **📢 KAP:** Takip listesindeki BIST şirketlerinin önemli bildirimleri (özel durum, finansal rapor, kâr payı,
+  sermaye artırımı, geri alım, yeni iş ilişkisi, ihale…) 2 dakikada bir kontrol edilir ve link ile gönderilir.
+  Rutin bildirimler (genel kurul ilanı vb.) gönderilmez. `KAP_ALERTS=0` kapatır, `KAP_MAX_PER_HOUR` (10).
+- **📅 Takvim:** Her iş günü 09:00'da önümüzdeki 3 günün bilanço ve temettü (hak düşüm) tarihleri
+  (ABD + BIST takip listesi). Olay yoksa mesaj gitmez. `TAKVIM=0` kapatır, `TAKVIM_HOUR`, `TAKVIM_DAYS`.
+- **🤖 Komutlar** (gruba yaz, ~30 sn içinde cevap gelir): `/durum` · `/fiyat THYAO` (ya da AAPL, BTC) ·
+  `/takvim` · `/yardim`. Sadece bu gruptan gelen komutlar işlenir. `TG_COMMANDS=0` kapatır.
 
 ## Kurulum
 1. Settings → Secrets and variables → Actions: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`,

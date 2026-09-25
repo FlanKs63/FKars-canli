@@ -8,12 +8,13 @@ Akış (live_alerts.run_once):
   3) Gönderilen sinyal OpenSignal olarak kaydedilir; check_exit() her 5 dk'da çıkış koşullarına bakar
      (stop, sahte kırılım, hacimsiz yükseliş, hacimli doji, VWAP altı, büyük kırmızı mum)
 
-Ayarlar: LIVE_FILTERS=0 (filtreleri kapatır, eski davranış) · LIVE_RVOL_US=5 · LIVE_RVOL_BIST=3
+Ayarlar: LIVE_FILTERS=0 (filtreleri kapatır, eski davranış) · LIVE_MAX_SOFT=1 · LIVE_RVOL_US=5 · LIVE_RVOL_BIST=3
          LIVE_TRACK_HOURS=6 · LIVE_EXIT_CHECK_SEC=300 · LIVE_KASA (ör. 1000 → adet önerisi) · FINNHUB_KEY
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
@@ -137,7 +138,32 @@ def evaluate(alert, df5: pd.DataFrame | None, now: datetime, avg_vol: float | No
         gunluk_rvol_degeri=daily_rvol(df5, alert.market, now, avg_vol), kasa=kasa,
         min_gunluk_rvol=min_rvol(alert.market))
     res["kirilan"] = kirilan
-    return res
+    return apply_policy(res)
+
+
+# Esnek kurallar: biri tek başına bozulursa sinyal "ORTA ⚠️" etiketiyle yine gönderilir.
+# Geri kalan her şey (kırılım fitilde kaldı, fiyat VWAP altında, tepede doji, risk > %6, çok ucuz hisse)
+# zorunludur: biri bile bozulursa gönderilmez.
+SOFT_RULES = ("günlük RVOL düşük", "hacimsiz kırılım", "VWAP’tan", "TP1’den önce direnç")
+
+
+def apply_policy(res: dict) -> dict:
+    """sinyal_degerlendir sonucunu zorunlu/esnek kurala göre yeniden karar verir.
+    LIVE_MAX_SOFT (varsayılan 1): kaç esnek kural bozukken gönderilsin. 0 = arkadaşın katı modu."""
+    reasons = [r for r in (res.get("neden") or "").split("; ") if r and r != "tüm filtreler geçti"]
+    soft = [r for r in reasons if r.startswith(SOFT_RULES)]
+    hard = [r for r in reasons if r not in soft]
+    max_soft = int(env_float("LIVE_MAX_SOFT", 1))
+    out = dict(res)
+    out["zorunlu"], out["esnek"] = hard, soft
+    if "mesaj_ek" not in res:                         # yetersiz veri gibi erken çıkışlar
+        out["gonder"] = False
+        return out
+    out["gonder"] = not hard and len(soft) <= max_soft
+    if out["gonder"]:
+        label = "GÜÇLÜ ✅" if not soft else f"ORTA ⚠️ ({'; '.join(soft)})"
+        out["mesaj_ek"] = re.sub(r"Sinyal: (ZAYIF|GÜÇLÜ)", f"Sinyal: {label}", res["mesaj_ek"], count=1)
+    return out
 
 
 def filtered_message(alert, res: dict, news_line: str = "") -> str:

@@ -219,18 +219,29 @@ def run_main(bot_name: str, func) -> None:
 
 _gemini_client = None
 _gemini_calls = 0
+_gemini_off = False
+_gemini_search_off = False
+
+
+def _is_quota_error(e: Exception) -> bool:
+    msg = str(e)
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower()
 
 
 def gemini_text(prompt: str, max_chars: int = 400, search: bool = False) -> str:
     """Gemini'den kısa metin ister. Anahtar yoksa, limit dolduysa veya hata
-    olursa boş string döner — mesajın geri kalanı yine gönderilir."""
-    global _gemini_client, _gemini_calls
+    olursa boş string döner — mesajın geri kalanı yine gönderilir.
+
+    Kota dolarsa (429): önce Google aramasız dener; o da doluysa bu çalıştırmada
+    Gemini'yi tamamen kapatır ve logu tek satırla bildirir (her mesajda hata basmaz)."""
+    global _gemini_client, _gemini_calls, _gemini_off, _gemini_search_off
 
     api_key = env_str("GEMINI_API_KEY")
-    if not api_key:
+    if not api_key or _gemini_off:
         return ""
     if _gemini_calls >= env_int("MAX_AI_CALLS", 12):
         return ""
+    use_search = search and env_str("GEMINI_SEARCH", "1") != "0" and not _gemini_search_off
 
     try:
         if _gemini_client is None:
@@ -238,7 +249,7 @@ def gemini_text(prompt: str, max_chars: int = 400, search: bool = False) -> str:
             _gemini_client = genai.Client(api_key=api_key)
         _gemini_calls += 1
         kwargs = {}
-        if search and env_str("GEMINI_SEARCH", "1") != "0":
+        if use_search:
             # Google Search ile güncel bilgi (haber) araştırması
             from google.genai import types
             kwargs["config"] = types.GenerateContentConfig(
@@ -253,7 +264,15 @@ def gemini_text(prompt: str, max_chars: int = 400, search: bool = False) -> str:
             text = text[:max_chars].rsplit(" ", 1)[0] + "…"
         return text
     except Exception as e:  # noqa: BLE001
-        print(redact(f"  Gemini yanıtı alınamadı: {e}"))
+        if _is_quota_error(e):
+            if use_search:
+                _gemini_search_off = True
+                print("  Gemini arama kotası doldu → bu çalıştırmada aramasız devam")
+                return gemini_text(prompt, max_chars, search=False)
+            _gemini_off = True
+            print("  Gemini kotası doldu → bu çalıştırmada AI yorumları kapalı (mesajlar yine gider)")
+            return ""
+        print(redact(f"  Gemini yanıtı alınamadı: {str(e)[:200]}"))
         return ""
 
 

@@ -8,6 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -15,8 +16,9 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ["DRY_RUN"] = "1"
 os.environ.pop("GEMINI_API_KEY", None)
+os.environ["GOOGLE_NEWS"] = "0"      # testlerde internete çıkma
 
-from bot import filtre, live  # noqa: E402
+from bot import filtre, kap, komutlar, live, takvim  # noqa: E402
 import live_alerts  # noqa: E402
 
 
@@ -205,6 +207,22 @@ class TestFilters(unittest.TestCase):
                                  send=send, rejected=rejected, fetch5=fetch5, avg_vol=lambda s, d: 1.0)
         fetch5.assert_not_called()
 
+    def test_policy_hard_and_soft(self):
+        base = {"mesaj_ek": "\nGiriş: 1\nHacim: 2x · Sinyal: ZAYIF", "stop": 1, "hedefler": [2]}
+        ok = filtre.apply_policy({**base, "neden": "tüm filtreler geçti"})
+        self.assertTrue(ok["gonder"])
+        self.assertIn("Sinyal: GÜÇLÜ ✅", ok["mesaj_ek"])
+        one_soft = filtre.apply_policy({**base, "neden": "günlük RVOL düşük (2.6x < 5x)"})
+        self.assertTrue(one_soft["gonder"])
+        self.assertIn("ORTA ⚠️ (günlük RVOL düşük", one_soft["mesaj_ek"])
+        two_soft = filtre.apply_policy({**base, "neden": "günlük RVOL düşük (2x < 5x); TP1’den önce direnç var (önü kapalı)"})
+        self.assertFalse(two_soft["gonder"])
+        hard = filtre.apply_policy({**base, "neden": "fiyat VWAP altında"})
+        self.assertFalse(hard["gonder"])
+        self.assertFalse(filtre.apply_policy({"gonder": False, "neden": "yetersiz veri"})["gonder"])
+        with mock.patch.dict(os.environ, {"LIVE_MAX_SOFT": "0"}):              # arkadaşın katı modu
+            self.assertFalse(filtre.apply_policy({**base, "neden": "günlük RVOL düşük (2x < 5x)"})["gonder"])
+
     def test_daily_rvol_and_prev_high(self):
         df = five_min()
         rv = filtre.daily_rvol(df, "us", self.NOW, avg_vol=1_000_000)
@@ -290,6 +308,99 @@ class TestExitTracking(unittest.TestCase):
             cd2, opened2 = live_alerts.load_state(path)
             self.assertIn("AAA", cd2)
             self.assertEqual(opened2["XYZ"].tp1, 11)
+
+
+class TestKap(unittest.TestCase):
+    ITEMS = [
+        {"disclosureIndex": 101, "kapTitle": "TÜRK HAVA YOLLARI A.O.", "subject": "Özel Durum Açıklaması (Genel)",
+         "summary": "Uçak siparişi", "relatedStocks": "THYAO", "publishDate": "25.09.26 10:15:00"},
+        {"disclosureIndex": 102, "kapTitle": "X", "subject": "Genel Kurul Toplantı İlanı", "relatedStocks": "THYAO"},
+        {"disclosureIndex": 103, "kapTitle": "Y", "subject": "Özel Durum Açıklaması (Genel)", "relatedStocks": "ABCDE"},
+    ]
+
+    def _session(self):
+        s = mock.Mock()
+        s.post.return_value = mock.Mock(status_code=200, json=mock.Mock(return_value=self.ITEMS))
+        return s
+
+    def test_first_run_marks_seen_without_sending(self):
+        seen, send = [], mock.Mock()
+        now = datetime(2026, 9, 25, 10, 20, tzinfo=timezone.utc)
+        self.assertEqual(kap.check({"THYAO"}, seen, now, send, self._session(), first_run=True), 0)
+        send.assert_not_called()
+        self.assertEqual(len(seen), 3)
+
+    def test_sends_only_important_watchlist(self):
+        seen, send = [], mock.Mock()
+        now = datetime(2026, 9, 25, 10, 20, tzinfo=timezone.utc)
+        n = kap.check({"THYAO"}, seen, now, send, self._session())
+        self.assertEqual(n, 1)                                  # genel kurul ve listede olmayan şirket gitmez
+        msg = send.call_args[0][0]
+        self.assertIn("📢 KAP · $THYAO", msg)
+        self.assertIn("https://www.kap.org.tr/tr/Bildirim/101", msg)
+        self.assertEqual(kap.check({"THYAO"}, seen, now, send, self._session()), 0)   # tekrar yok
+
+
+class TestTakvim(unittest.TestCase):
+    def test_collect_and_message(self):
+        from datetime import date
+        today = date(2026, 9, 25)
+        cals = {"AAPL": {"Earnings Date": [date(2026, 9, 26)]},
+                "THYAO.IS": {"Ex-Dividend Date": date(2026, 9, 25)},
+                "MSFT": {"Earnings Date": [date(2026, 10, 30)]}}
+        ev = takvim.collect({"AAPL": "$AAPL", "THYAO.IS": "$THYAO", "MSFT": "$MSFT"}, today,
+                            calendar_fn=lambda s: cals.get(s))
+        self.assertEqual([e[2] for e in ev], ["$THYAO", "$AAPL"])
+        msg = takvim.message(ev, today)
+        self.assertIn("• $AAPL — yarın", msg)
+        self.assertIn("• $THYAO — bugün", msg)
+        self.assertIsNone(takvim.message([], today))
+
+    def test_due(self):
+        tr = ZoneInfo("Europe/Istanbul")
+        self.assertTrue(takvim.due(datetime(2026, 9, 25, 9, 5, tzinfo=tr), None))
+        self.assertFalse(takvim.due(datetime(2026, 9, 25, 9, 5, tzinfo=tr), "2026-09-25"))
+        self.assertFalse(takvim.due(datetime(2026, 9, 25, 8, 0, tzinfo=tr), None))
+        self.assertFalse(takvim.due(datetime(2026, 9, 26, 10, 0, tzinfo=tr), None))       # cumartesi
+
+
+class TestKomutlar(unittest.TestCase):
+    def upd(self, uid, text, chat="-100"):
+        return {"update_id": uid, "message": {"chat": {"id": int(chat)}, "text": text}}
+
+    def test_parse_and_resolve(self):
+        self.assertEqual(komutlar.parse_command(self.upd(1, "/fiyat thyao"), "-100"), ("fiyat", ["thyao"]))
+        self.assertEqual(komutlar.parse_command(self.upd(1, "/Durum@KRS_bot"), "-100"), ("durum", []))
+        self.assertIsNone(komutlar.parse_command(self.upd(1, "/durum", chat="-999"), "-100"))   # başka sohbet
+        self.assertIsNone(komutlar.parse_command(self.upd(1, "merhaba"), "-100"))
+        crypto = {"BTC-USD": "BITCOIN ($)"}
+        self.assertEqual(komutlar.resolve_symbol("thyao", {"THYAO"}, crypto), ("THYAO.IS", "$THYAO"))
+        self.assertEqual(komutlar.resolve_symbol("btc", {"THYAO"}, crypto), ("BTC-USD", "BITCOIN ($)"))
+        self.assertEqual(komutlar.resolve_symbol("$aapl", {"THYAO"}, crypto), ("AAPL", "$AAPL"))
+
+    def test_price_and_handle(self):
+        df = pd.DataFrame({"Close": [100.0, 105.0]})
+        self.assertEqual(komutlar.price_text("AAPL", "$AAPL", fetch=lambda s: df), "💲 $AAPL: 105.00 (+5.00% günlük)")
+        self.assertIn("gecikmeli", komutlar.price_text("THYAO.IS", "$THYAO", fetch=lambda s: df))
+        send = mock.Mock()
+        n = komutlar.handle([self.upd(5, "/yardim"), self.upd(6, "/bilinmeyen")], "-100",
+                            {"yardim": lambda a: "liste"}, send)
+        self.assertEqual(n, 1)
+        self.assertEqual(komutlar.next_offset([self.upd(5, "x"), self.upd(9, "y")], 0), 10)
+
+    def test_side_tasks_commands_and_first_run(self):
+        now = datetime(2026, 9, 26, 3, 0, tzinfo=timezone.utc)          # cumartesi gece: KAP/takvim yok
+        send = mock.Mock()
+        extra = {}
+        ups = [self.upd(7, "/durum")]
+        with mock.patch.dict(os.environ, {"TELEGRAM_CHAT_ID": "-100"}), \
+                mock.patch.object(komutlar, "get_updates", return_value=ups):
+            live_alerts.side_tasks(now, ["kripto"], {}, extra, send=send)
+            send.assert_not_called()                                      # ilk açılış: eski komuta cevap yok
+            self.assertEqual(extra["tg_offset"], 8)
+            live_alerts.side_tasks(now, ["kripto"], {}, extra, send=send)
+        self.assertIn("✅ Bot çalışıyor", send.call_args[0][0])
+        self.assertIn("kripto", send.call_args[0][0])
 
 
 if __name__ == "__main__":
