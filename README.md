@@ -9,7 +9,7 @@ durumlarda Telegram'a yazar:
 
 Aynı hisseye 45 dakika tekrar yazmaz (fiyat son alarmdan %5 daha yükselirse yazar), saatte en
 fazla 15 mesaj. İzlenenler: ABD hisseleri + günün en çok yükselen / en aktif / küçük şirket
-listeleri (0,5-20 $, ön piyasa 11:00 TR'den itibaren), kripto (7/24), BIST (~15 dk gecikmeli).
+listeleri (0,5-20 $, ön piyasa 11:00 TR'den itibaren), kripto (7/24), **BIST 100 hisseleri** (~15 dk gecikmeli; başlıkta `(BIST 30)` ya da `(BIST 100)` yazar).
 Alarm çıkınca Gemini o hisse için internette haber arar (anahtar varsa).
 
 ## Sinyal filtreleri (`sinyal_filtreleri.py`)
@@ -51,14 +51,44 @@ Ayarlar: `LIVE_FILTERS=0` (filtreleri kapatır, eski davranış) · `LIVE_MAX_SO
 `LIVE_TRACK_HOURS` (6) · `LIVE_EXIT_CHECK_SEC` (300) · `LIVE_KASA` (ör. 1000 → adet önerisi).
 Eşikleri değiştirmek için `sinyal_filtreleri.py` başındaki sabitler düzenlenir.
 
+## BIST 100 / BIST 30 önceliği
+Hiçbir piyasa kapalı değil (ABD, kripto, BIST). BIST tarafında BIST 100'ün 100 hissesi izlenir ve öncelik alır:
+- Her turda önce BIST taranır, içinde önce BIST 30 hisseleri.
+- BIST seansı açıkken saatlik mesaj sınırının **5'i BIST'e ayrılır** (ABD/kripto en fazla 10 kullanır).
+  `LIVE_BIST_RESERVE` (5) ile değişir, `0` ayırmayı kapatır.
+- Başlıkta `(BIST 30)` ya da `(BIST 100)` yazar.
+
+Liste `bot/universe.py` içinde; Borsa İstanbul'un 21 Eylül 2026 duyurusuna göre **1 Ekim - 31 Aralık 2026**
+dönemi (1 Ekim'den önce bir önceki dönem listesi kullanılır). Borsa İstanbul listeyi 3 ayda bir yeniler;
+yeni dönemde koda dokunmadan workflow `env:` kısmına `BIST100_LISTE="AEFES,AKBNK,..."` ve
+`BIST30_LISTE="..."` yazılabilir. Dönem bitip liste güncellenmezse log'a `UYARI: BIST 100/30 listesinin dönemi …` düşer.
+
 ## KAP bildirimleri, takvim ve Telegram komutları
-- **📢 KAP:** Takip listesindeki BIST şirketlerinin önemli bildirimleri (özel durum, finansal rapor, kâr payı,
+- **📢 KAP:** BIST 100 şirketlerinin önemli bildirimleri (özel durum, finansal rapor, kâr payı,
   sermaye artırımı, geri alım, yeni iş ilişkisi, ihale…) 2 dakikada bir kontrol edilir ve link ile gönderilir.
   Rutin bildirimler (genel kurul ilanı vb.) gönderilmez. `KAP_ALERTS=0` kapatır, `KAP_MAX_PER_HOUR` (10).
 - **📅 Takvim:** Her iş günü 09:00'da önümüzdeki 3 günün bilanço ve temettü (hak düşüm) tarihleri
-  (ABD + BIST takip listesi). Olay yoksa mesaj gitmez. `TAKVIM=0` kapatır, `TAKVIM_HOUR`, `TAKVIM_DAYS`.
+  (ABD takip listesi + BIST 100). Olay yoksa mesaj gitmez. `TAKVIM=0` kapatır, `TAKVIM_HOUR`, `TAKVIM_DAYS`.
+- **🔁 Geri alım özeti** (komut gerekmez): her iş günü 21:00'de (`GERI_ALIM_SAAT`) KAP'taki pay geri alımları
+  tek, kısa mesajda gelir. Önce BIST 30 / BIST 100 şirketleri, sonra diğerleri:
+  ```
+  🔁 GERİ ALIMLAR — 25.09
+
+  $TTKOM ⭐BIST 30 · 365 bin lot · 22,7 mn TL
+  $DAGI · 4,1 mn lot · ≈22,5 mn TL
+  Tutar okunamadı: XYZ
+
+  Toplam ≈ 45,2 mn TL
+  ```
+  TL = lot × bildirimdeki işlem fiyatı (aralık verilmişse ortası, `≈`). En fazla 15 satır (`GERI_ALIM_MAX`).
+  Akşam geç ya da ertesi sabah yayımlanan bildirimler bir sonraki özete girer. `GERI_ALIM=0` kapatır.
 - **🤖 Komutlar** (gruba yaz, ~30 sn içinde cevap gelir): `/durum` · `/fiyat THYAO` (ya da AAPL, BTC) ·
-  `/takvim` · `/sonuc` · `/yardim`. Sadece bu gruptan gelen komutlar işlenir. `TG_COMMANDS=0` kapatır.
+  `/analiz THYAO` · `/geri` · `/takvim` · `/sonuc` · `/yardim`. Sadece bu gruptan gelen komutlar işlenir.
+  `TG_COMMANDS=0` kapatır.
+  - `/analiz THYAO` (ya da `/seviye`, isteğe bağlı): o hissenin giriş / kademe / stop seviyeleri, kanal
+    formatında kısa (`$THYAO` · giriş · Kademelerim · Stopum). Zayıfsa altına tek satır `⚠️ Zayıf` yazar.
+    Komut yazmadan her akşam BIST 100/30'dan 5 hisse zaten otomatik gelir (borsa tarayıcı, `👀 İzleme listesi`).
+  - `/geri`: günün geri alım özeti (hazırsa).
 
 ## Güvenilirlik
 - **Tatiller:** BIST ve ABD tatilleri/yarım günleri tanımlı (`bot/tatil.py`); tatilde o piyasa taranmaz.

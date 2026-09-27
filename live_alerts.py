@@ -41,8 +41,9 @@ from bot.common import (env_float, env_int, env_str, gemini_text, redact, requir
                         run_main, send_telegram)
 from bot.live import Cooldown, alert_message, detect, is_fresh, market_open
 from bot.market_data import _extract
-from bot import kap, komutlar, takvim, tatil
-from bot.universe import BIST_STOCKS, CRYPTO, GYO, US_STOCKS
+from bot import geri_alim, kap, komutlar, takvim, tatil
+from bot.universe import (BIST30, BIST100, BIST_DONEM_BITIS, BIST_STOCKS, CRYPTO, GYO, US_STOCKS,
+                          bist_etiket, is_gyo, liste_eski_mi, oncelik)
 from zoneinfo import ZoneInfo
 
 takvim_tz = ZoneInfo("Europe/Istanbul")
@@ -101,7 +102,8 @@ def watchlist(market: str, movers: dict[str, str]) -> dict[str, str]:
     if market == "kripto":
         return dict(CRYPTO)
     if market == "bist":
-        return {f"{s}.IS": f"${s}" for s in BIST_STOCKS}
+        # BIST 100 hisseleri; önce BIST 30 (öncelik), sonra diğerleri
+        return {f"{s}.IS": f"${s} ({bist_etiket(s)})" for s in sorted(BIST100, key=lambda s: -oncelik(s))}
     return {}
 
 
@@ -154,6 +156,9 @@ def run_once(markets: list[str], cooldown: Cooldown, movers: dict[str, str], now
     rejected = rejected if rejected is not None else {}
     use_filters = filtre.enabled()
     sent = 0
+    # Öncelik: BIST (BIST 100/30) önce taranır ve seans açıkken saatlik sınırın bir kısmı ona ayrılır
+    markets = sorted(markets, key=lambda m: m != "bist")
+    reserve = env_int("LIVE_BIST_RESERVE", 5) if "bist" in markets and market_open("bist", now) else 0
     for market in markets:
         if not market_open(market, now):
             continue
@@ -167,7 +172,7 @@ def run_once(markets: list[str], cooldown: Cooldown, movers: dict[str, str], now
             if sym in stale:
                 continue
             alert = detect(df, sym, wl.get(sym, sym), market, MIN_DOLLAR_5M.get(market, 50_000))
-            if alert is None or not cooldown.allow(sym, alert.price, now):
+            if alert is None or not cooldown.allow(sym, alert.price, now, reserve=0 if market == "bist" else reserve):
                 continue
             last_reject = rejected.get(sym)
             if last_reject and (now - last_reject).total_seconds() < 300:
@@ -281,10 +286,11 @@ def calendar_message(now: datetime) -> str | None:
 
 class CalendarJob:
     """Takvim ~130 hisse için tek tek Yahoo'ya soruyor (1-3 dk). Alarm döngüsü donmasın diye arka planda
-    hazırlanır; sonuç önbellekte tutulur, /takvim komutu önbelleği döndürür."""
+    hazırlanır; sonuç önbellekte tutulur, /takvim komutu önbelleği döndürür. (Geri alım özeti de aynı sınıfla.)"""
 
-    def __init__(self, build=None):
+    def __init__(self, build=None, label: str = "Takvim"):
         self.build = build or calendar_message
+        self.label = label
         self.thread: threading.Thread | None = None
         self.result: tuple[str, str | None, bool] | None = None      # (gün, mesaj, başarılı)
 
@@ -300,7 +306,7 @@ class CalendarJob:
             try:
                 self.result = (day, self.build(now), True)
             except Exception as e:  # noqa: BLE001
-                print(redact(f"  Takvim hazırlanamadı: {str(e)[:150]}"))
+                print(redact(f"  {self.label} hazırlanamadı: {str(e)[:150]}"))
                 self.result = (day, None, False)
 
         self.thread = threading.Thread(target=work, daemon=True)
@@ -313,6 +319,29 @@ class CalendarJob:
 
 calendar_job = CalendarJob()
 NO_EVENTS = "📅 Önümüzdeki günlerde takip listesinde bilanço/temettü yok."
+
+
+def buyback_build(now: datetime, seen: dict, since: str | None):
+    """Arka planda: KAP geri alım bildirimlerini oku → (mesaj, güncellenmiş seen)."""
+    now_tr = now.astimezone(takvim_tz)
+    entries = geri_alim.collect(now_tr, seen, since=since)
+    return geri_alim.message(entries, str(now_tr.date())), seen
+
+
+buyback_job = CalendarJob(label="Geri alım özeti")
+
+
+def resolve_for_analysis(query: str) -> tuple[str, str, str]:
+    """'/analiz' için (yahoo sembolü, görünen ad, varlık sınıfı). Bilinmeyen kod önce BIST (.IS) sayılır."""
+    q = query.strip().upper().replace("İ", "I").lstrip("$#").removesuffix(".IS")
+    sym, disp = komutlar.resolve_symbol(q, set(BIST_STOCKS) | set(GYO), dict(CRYPTO))
+    if sym in CRYPTO:
+        return sym, disp, "kripto"
+    if sym.endswith(".IS") or q not in US_STOCKS:
+        code = q
+        tag = bist_etiket(code)
+        return f"{code}.IS", f"${code} ({tag})" if tag else f"${code}", "gyo" if is_gyo(code) else "bist"
+    return sym, disp, "hisse"
 
 
 def command_handlers(now: datetime, markets: list[str], tracker: dict, extra: dict | None = None) -> dict:
@@ -331,8 +360,27 @@ def command_handlers(now: datetime, markets: list[str], tracker: dict, extra: di
         calendar_job.start(now)
         return "📅 Takvim hazırlanıyor, 1-2 dakika sonra /takvim yaz."
 
+    def analiz(args):
+        if not args:
+            return "Kullanım: /analiz THYAO  (BIST, ABD hissesi ya da BTC/ETH)"
+        sym, disp, cls = resolve_for_analysis(args[0])
+        text = komutlar.analiz_text(sym, disp, cls)
+        if text is None and cls in ("bist", "gyo"):         # BIST'te yoksa ABD sembolü olarak dene
+            code = sym.removesuffix(".IS")
+            text = komutlar.analiz_text(code, f"${code}", "hisse")
+        return text or f"{disp}: veri bulunamadı (sembolü kontrol et)"
+
+    def geri(args):
+        msg = extra.get("geri_alim_msg")
+        if msg:
+            return msg
+        return (f"🔁 Bugünün geri alım özeti saat {env_int('GERI_ALIM_SAAT', 21)}:00'dan sonra hazırlanır "
+                "(KAP bildirimleri akşam yayımlanıyor).")
+
     return {
         "yardim": lambda args: "\n".join(komutlar.HELP),
+        "analiz": analiz,
+        "geri": geri,
         "durum": lambda args: komutlar.status_text(now, markets, market_open, tracker),
         "fiyat": fiyat,
         "takvim": takvim_cmd,
@@ -389,8 +437,35 @@ def side_tasks(now: datetime, markets: list[str], tracker: dict, extra: dict, se
         text = filtre.results_summary(extra.get("results") or [], today_s, "⚡ CANLI ALARM — BUGÜNÜN SONUÇLARI")
         if text:
             safe_send(send, text)
+    # pay geri alım özeti: işlem günlerinde GERI_ALIM_SAAT (21) sonrası, arka planda hazırlanır
+    buyback_tasks(now, now_tr, today_s, extra, send, mono)
     if (takvim.due(now_tr, extra.get("takvim_date")) and not job.running()
             and mono - _timers.get("takvim_fail", -1e9) >= 1800):
+        job.start(now)
+
+
+def buyback_tasks(now: datetime, now_tr: datetime, today_s: str, extra: dict, send, mono: float,
+                  job: CalendarJob | None = None) -> None:
+    job = job or buyback_job
+    res = job.take()
+    if res:
+        day, payload, ok = res
+        if ok and payload:
+            msg, seen = payload
+            cutoff = str(now_tr.date() - timedelta(days=10))
+            extra["geri_alim_seen"] = {k: v for k, v in seen.items() if v >= cutoff}
+            extra["geri_alim_date"] = extra["geri_alim_last"] = day
+            extra["geri_alim_msg"] = msg or "🔁 Bugün KAP'ta yeni pay geri alım bildirimi yok."
+            if msg:
+                safe_send(send, msg)
+        else:
+            _timers["geri_fail"] = mono                # 30 dk sonra tekrar dene
+    if (env_str("GERI_ALIM", "1") != "0" and tatil.is_trading_day("bist", now_tr.date())
+            and now_tr.hour >= env_int("GERI_ALIM_SAAT", 21) and extra.get("geri_alim_date") != today_s
+            and not job.running() and mono - _timers.get("geri_fail", -1e9) >= 1800):
+        seen = dict(extra.get("geri_alim_seen") or {})
+        since = extra.get("geri_alim_last")
+        job.build = lambda n: buyback_build(n, seen, since)
         job.start(now)
 
 
@@ -433,6 +508,10 @@ _timers: dict[str, float] = {}
 def main() -> None:
     require_telegram_env()
     markets = [m.strip() for m in env_str("LIVE_MARKETS", "us,kripto,bist").split(",") if m.strip()]
+    if "bist" in markets and liste_eski_mi():
+        print(f"UYARI: BIST 100/30 listesinin dönemi {BIST_DONEM_BITIS} tarihinde bitti; "
+              "bot/universe.py'deki listeyi ya da BIST100_LISTE / BIST30_LISTE env'ini güncelle.")
+    print(f"BIST izleme listesi: {len(BIST100)} hisse (BIST 100) · {len(BIST30)} tanesi BIST 30")
     poll = max(env_int("LIVE_POLL_SECONDS", 30), 10)
     max_minutes = env_int("LIVE_MAX_MINUTES", 340)
     cooldown = Cooldown(env_float("LIVE_COOLDOWN_MIN", 45), env_float("LIVE_REARM_PCT", 0.05),

@@ -6,12 +6,14 @@ kapanış fiyatı olan fon verisi (TEFAS) için ortak kullanılır.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
 from .common import env_float, env_str, gemini_text, with_footer
+from .universe import bist_etiket
 
 MIN_BARS = 120            # bundan kısa geçmişi olan varlık analiz edilmez
 MAX_60D_RETURN = 0.40     # son 60 günde %40+ yükselmişse "geç kalınmış" cezası
@@ -39,7 +41,8 @@ CLASS_LABELS = {
 }
 
 # Hacim verisi olmayan / güvenilmez sınıflar
-NO_VOLUME_CLASSES = {"endeks", "emtia", "doviz"} | {c for c in CLASS_LABELS if c.startswith("fon_")}
+# BYF hacmi fiyat ilgisini değil fon giriş/çıkışını gösterir → hacimsiz gibi puanlanır
+NO_VOLUME_CLASSES = {"endeks", "emtia", "doviz", "byf"} | {c for c in CLASS_LABELS if c.startswith("fon_")}
 
 
 # =============================================================================
@@ -206,8 +209,12 @@ def compute_features(df_raw: pd.DataFrame, asset_class: str) -> pd.DataFrame:
     tol = np.maximum(0.02, vol_pct)
     near_support = (((f["price"] - f["ema20"]).abs() / f["price"] <= tol)
                     | ((f["price"] - f["ema50"]).abs() / f["price"] <= tol))
-    f["dip_buy"] = ((f["daily_change"] <= -dip_threshold) & f["trend_long"]
-                    & (f["price"] >= f["ema50"] * 0.97) & f["rsi"].between(30, 55) & near_support)
+    # Backtest: düşüşte al sinyalleri zayıftı (kâr faktörü 1.29). Sıkılaştırma: fiyat EMA200 üstünde
+    # kalmalı ve düşüş "panik/haber çöküşü" olmamalı (günlük oynaklığın 3 katından sert düşüşte alma).
+    panic = f["daily_change"] < -np.maximum(env_float("DIP_MAX_DROP_VOL", 3.0) * vol_pct, 0.05)
+    f["dip_buy"] = ((f["daily_change"] <= -dip_threshold) & f["trend_long"] & ~panic
+                    & (f["price"] > f["ema200"]) & (f["price"] >= f["ema50"] * 0.97)
+                    & f["rsi"].between(30, 55) & near_support)
     f["score"] = (score + 10 * f["dip_buy"]).clip(0, 100)
 
     momentum = f["breakout_20d"] | (f["has_volume"] & (f["rel_vol"] >= 2)) | (f["macd_up"] & (f["price"] > f["ema20"]))
@@ -343,6 +350,29 @@ def fmt_price(x: float) -> str:
     return f"{x:.6f}".rstrip("0").rstrip(".")
 
 
+def kisa_mesaj(sig: Signal, note: str = "") -> str:
+    """Kanal formatında çok kısa mesaj (otomatik analiz ve /analiz için):
+
+        $MTEN
+
+        1.15-1.20 giriş sağlayacağım
+
+        Kademelerim:1.25-1.32-1.38-1.44-1.50++
+
+        Stopum:1.05 altı
+    """
+    first = env_str("FIRST_PERSON", "1") != "0"
+    entry_word, kad_word, stop_word = (("giriş sağlayacağım", "Kademelerim", "Stopum") if first
+                                       else ("giriş uygun", "Kademeler", "Stop"))
+    name = re.sub(r"\s*\(.*?\)\s*$", "", sig.display) if sig.symbol.endswith(".IS") else sig.display
+    kademeler = "-".join(fmt_price(t) for t in sig.targets[:-1]) + f"-{fmt_price(sig.targets[-1])}++"
+    lines = [name, "", f"{fmt_price(sig.entry_low)}-{fmt_price(sig.entry_high)} {entry_word}", "",
+             f"{kad_word}:{kademeler}", "", f"{stop_word}:{fmt_price(sig.stop)} altı"]
+    if note:
+        lines += ["", note]
+    return with_footer(lines)
+
+
 def news_note(sig: Signal) -> str:
     """Gemini + Google Search ile son haberlerin 1-2 cümlelik özeti (anahtar yoksa boş)."""
     label = CLASS_LABELS.get(sig.asset_class, sig.asset_class)
@@ -353,7 +383,34 @@ def news_note(sig: Signal) -> str:
         "yönetim, sektör, makro). Önemli haber yoksa sadece 'Önemli haber yok.' yaz. "
         "'Al' veya 'sat' deme, fiyat tahmini yapma, kaynağı olmayan rakam yazma."
     )
-    return gemini_text(prompt, max_chars=260, search=True)
+    return gemini_text(prompt, max_chars=260, search=True) or google_news_note(sig)
+
+
+def google_news_query(sig: Signal) -> tuple[str, str] | None:
+    """Google Haberler araması için (sorgu, dil). Fonlarda None (isimler çok uzun, haber az)."""
+    cls = sig.asset_class
+    if cls.startswith("fon_"):
+        return None
+    code = sig.symbol.removesuffix(".IS")
+    name = re.sub(r"\s*\(.*?\)", "", sig.display).lstrip("$").strip() or code
+    if cls in ("bist", "gyo", "byf"):
+        return f"{code} hisse", "tr"
+    if cls == "endeks":
+        return f"Borsa İstanbul {code}", "tr"
+    if cls == "hisse":
+        return f"{code} stock", "en"
+    return name, "tr"                                # kripto, altın, döviz
+
+
+def google_news_note(sig: Signal) -> str:
+    """Gemini boş dönerse (anahtar yok / kota doldu) Google Haberler'den son 48 saatin başlıkları."""
+    if env_str("GOOGLE_NEWS", "1") == "0":
+        return ""
+    q = google_news_query(sig)
+    if not q:
+        return ""
+    from . import google_news
+    return google_news.summary(q[0], lang=q[1], max_chars=260)
 
 
 def technical_line(sig: Signal) -> str:
@@ -374,6 +431,15 @@ def risk_reward(sig: Signal, level: int) -> float | None:
     if risk <= 0:
         return None
     return (sig.targets[level - 1] - sig.price) / risk
+
+
+def tur_etiketi(sig: Signal) -> str:
+    """'BIST 30 hisse' / 'BIST 100 hisse' / 'BIST 30 · GYO'; diğer sınıflarda CLASS_LABELS."""
+    label = CLASS_LABELS.get(sig.asset_class, sig.asset_class)
+    etiket = bist_etiket(sig.symbol) if sig.asset_class in ("bist", "gyo") else ""
+    if not etiket:
+        return label
+    return f"{etiket} hisse" if sig.asset_class == "bist" else f"{etiket} · {label}"
 
 
 def action_label(sig: Signal, weak_market: bool = False) -> str:
@@ -444,7 +510,7 @@ def build_message(sig: Signal, extra_line: str = "", with_ai: bool = True,
         lines.append(f"📰 Haber: {note}")
     lines += [
         technical_line(sig),
-        f"Tür: {CLASS_LABELS.get(sig.asset_class, sig.asset_class)} · Skor {sig.score:.0f}/100",
+        f"Tür: {tur_etiketi(sig)} · Skor {sig.score:.0f}/100",
     ]
     if extra_line:
         lines.append(extra_line)

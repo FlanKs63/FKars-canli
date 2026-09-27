@@ -5,6 +5,8 @@
   /fiyat THYAO       anlık fiyat ve günlük değişim (BIST, ABD, kripto: BTC, ETH …)
   /takvim            önümüzdeki günlerin bilanço / temettü takvimi
   /sonuc             canlı alarmların son 7 gündeki sonucu (kazanma oranı, ortalama)
+  /analiz THYAO      giriş / kademe / stop, kanal formatında kısa (eşik altındaysa tek satır uyarı)
+  /geri              bugünün pay geri alım özeti (KAP)
 
 Yalnız TELEGRAM_CHAT_ID'deki sohbetten gelen komutlar işlenir (başka yerden gelenler yok sayılır).
 getUpdates ile çekilir (webhook gerekmez); son okunan update_id state'te tutulur.
@@ -23,6 +25,8 @@ HELP = [
     "",
     "/durum — bot çalışıyor mu, takip edilen sinyaller",
     "/fiyat THYAO — anlık fiyat (BIST, ABD, BTC/ETH…)",
+    "/analiz THYAO — giriş, kademe ve stop seviyeleri",
+    "/geri — bugünün pay geri alımları (lot, TL)",
     "/takvim — bilanço / temettü takvimi",
     "/sonuc — canlı alarmların son 7 gün sonucu",
     "/yardim — bu liste",
@@ -54,7 +58,9 @@ def parse_command(update: dict, chat_id: str) -> tuple[str, list[str]] | None:
         return None
     parts = text.split()
     cmd = parts[0][1:].split("@")[0].lower()
-    cmd = {"yardım": "yardim", "help": "yardim", "start": "yardim", "status": "durum", "price": "fiyat", "sonuç": "sonuc"}.get(cmd, cmd)
+    cmd = {"yardım": "yardim", "help": "yardim", "start": "yardim", "status": "durum", "price": "fiyat", "sonuç": "sonuc",
+           "analyze": "analiz", "seviye": "analiz", "gerialim": "geri", "geri_alim": "geri",
+           "gerialım": "geri"}.get(cmd, cmd)
     return cmd, parts[1:]
 
 
@@ -88,6 +94,41 @@ def price_text(symbol: str, display: str, fetch=None) -> str:
     chg = (last / float(close.iloc[-2]) - 1) * 100 if len(close) > 1 else 0.0
     delay = " · ~15 dk gecikmeli" if symbol.endswith(".IS") else ""
     return f"💲 {display}: {fmt_price(last)} ({chg:+.2f}% günlük){delay}"
+
+
+# /analiz için otomatik sinyal eşikleri (borsa tarayıcıyla aynı varsayılanlar; BIST 30/100'de öncelik indirimi)
+ESIK = {"bist": 75.0, "gyo": 80.0, "hisse": 75.0, "kripto": 80.0}
+
+
+def analiz_esigi(symbol: str, asset_class: str) -> float:
+    from .common import env_float
+    from .universe import oncelik
+    base = ESIK.get(asset_class, 75.0)
+    if asset_class in ("bist", "gyo") and symbol.endswith(".IS"):
+        p = oncelik(symbol)
+        base -= env_float("BIST30_AGIRLIK", 5) if p == 2 else env_float("BIST100_AGIRLIK", 3) if p == 1 else 0
+    return base
+
+
+def daily_frames(symbol: str) -> dict:
+    from .market_data import download_many
+    return download_many([symbol], period="2y")
+
+
+def analiz_text(symbol: str, display: str, asset_class: str, fetch=None) -> str | None:
+    """İstenen sembolün günlük analizini botun sinyal mesajı formatında döndürür. Veri yoksa None."""
+    from . import signals
+    from .market_data import drop_incomplete_bar
+    fetch = fetch or daily_frames
+    df = fetch(symbol).get(symbol)
+    if df is None or df.empty or "Close" not in df.columns:
+        return None
+    df = drop_incomplete_bar(df, asset_class)
+    sig = signals.analyze(df, symbol, display, asset_class)
+    if sig is None:
+        return f"{display}: analiz için yeterli geçmiş yok (en az ~1 yıllık günlük veri gerekir)"
+    weak = sig.score < analiz_esigi(symbol, asset_class)
+    return signals.kisa_mesaj(sig, "⚠️ Zayıf: bot bu hisseye sinyal vermezdi" if weak else "")
 
 
 def status_text(now: datetime, markets: list[str], open_fn, tracker: dict) -> str:
