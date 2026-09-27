@@ -17,8 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ["DRY_RUN"] = "1"
 os.environ.pop("GEMINI_API_KEY", None)
 os.environ["GOOGLE_NEWS"] = "0"      # testlerde internete çıkma
+os.environ["GERI_ALIM"] = "0"         # özet sadece ilgili testlerde açılır
 
-from bot import filtre, kap, komutlar, live, takvim  # noqa: E402
+from bot import filtre, geri_alim, kap, komutlar, live, takvim  # noqa: E402
 import live_alerts  # noqa: E402
 
 
@@ -541,6 +542,210 @@ class TestKomutlar(unittest.TestCase):
             live_alerts.side_tasks(now, ["kripto"], {}, extra, send=send)
         self.assertIn("✅ Bot çalışıyor", send.call_args[0][0])
         self.assertIn("kripto", send.call_args[0][0])
+
+
+
+def daily_bars(n=420, drift=0.003, seed=3, end="2026-09-25"):
+    rng = np.random.default_rng(seed)
+    close = 100 * np.cumprod(1 + drift + 0.01 * rng.standard_normal(n))
+    idx = pd.bdate_range(end=end, periods=n)
+    df = pd.DataFrame({"Close": close}, index=idx)
+    df["Open"] = df["Close"].shift(1).fillna(df["Close"])
+    df["High"] = df[["Open", "Close"]].max(axis=1) * 1.01
+    df["Low"] = df[["Open", "Close"]].min(axis=1) * 0.99
+    df["Volume"] = 5_000_000.0
+    return df
+
+
+class TestBistPriority(unittest.TestCase):
+    def test_bist_watchlist_is_bist100_bist30_first(self):
+        from bot import universe as u
+        wl = live_alerts.watchlist("bist", {})
+        self.assertEqual({k.removesuffix(".IS") for k in wl}, set(u.BIST100))
+        keys = list(wl)
+        self.assertTrue(all(k.removesuffix(".IS") in u.BIST30 for k in keys[:30]))   # önce BIST 30
+        b30 = u.BIST30[0]
+        only100 = next(s for s in u.BIST100 if s not in u.BIST30)
+        self.assertEqual(wl[f"{b30}.IS"], f"${b30} (BIST 30)")
+        self.assertEqual(wl[f"{only100}.IS"], f"${only100} (BIST 100)")
+        self.assertIn("AAPL", live_alerts.watchlist("us", {}))                          # ABD kapanmadı
+        self.assertIn("BTC-USD", live_alerts.watchlist("kripto", {}))                   # kripto kapanmadı
+
+    def test_kap_and_calendar_keep_old_gyos(self):
+        from bot import universe as u
+        syms, _ = live_alerts.calendar_symbols()
+        bist = {k.removesuffix(".IS") for k in syms if k.endswith(".IS")}
+        self.assertTrue(set(u.BIST100) <= bist)
+        self.assertTrue({"ISGYO", "OZKGY", "KZBGY", "AKFGY"} <= bist)
+
+    def test_cooldown_reserve(self):
+        now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+        cd = live.Cooldown(45, 0.05, 15)
+        for i in range(10):
+            cd.mark(f"S{i}", 1.0, now)
+        self.assertFalse(cd.allow("AAPL", 1.0, now, reserve=5))        # ABD: kalan 5 hak BIST'e ayrılmış
+        self.assertTrue(cd.allow("THYAO.IS", 1.0, now, reserve=0))     # BIST kullanabilir
+        self.assertTrue(cd.allow("AAPL", 1.0, now))                    # BIST seansı kapalıyken ayrım yok
+
+    def test_bist_scanned_first_and_reserve_only_in_session(self):
+        now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)       # 15:00 TR: BIST açık
+        fetch = mock.Mock(return_value={})
+        wl = lambda m, movers: {"bist": {"THYAO.IS": "$THYAO"}, "us": {"AAPL": "$AAPL"}}.get(m, {})  # noqa: E731
+        with mock.patch.object(live_alerts, "watchlist", side_effect=wl), \
+                mock.patch.object(live_alerts, "market_open", return_value=True):
+            live_alerts.run_once(["us", "kripto", "bist"], live.Cooldown(45, 0.05, 15), {}, now,
+                                 fetch=fetch, send=mock.Mock())
+        self.assertEqual(fetch.call_args_list[0][0][0], ["THYAO.IS"])
+
+
+class TestAnaliz(unittest.TestCase):
+    def test_resolve(self):
+        from bot import universe as u
+        b30 = u.BIST30[0]
+        self.assertEqual(live_alerts.resolve_for_analysis(b30.lower()), (f"{b30}.IS", f"${b30} (BIST 30)", "bist"))
+        self.assertEqual(live_alerts.resolve_for_analysis("aapl"), ("AAPL", "$AAPL", "hisse"))
+        self.assertEqual(live_alerts.resolve_for_analysis("btc")[2], "kripto")
+        self.assertEqual(live_alerts.resolve_for_analysis("MTEN"), ("MTEN.IS", "$MTEN", "bist"))   # BIST 100 dışı
+        self.assertEqual(live_alerts.resolve_for_analysis("isgyo.is")[2], "gyo")
+
+    def test_threshold_weight(self):
+        from bot import universe as u
+        b30 = u.BIST30[0]
+        only100 = next(s for s in u.BIST_STOCKS if s not in u.BIST30)
+        self.assertEqual(komutlar.analiz_esigi(f"{b30}.IS", "bist"), 70)
+        self.assertEqual(komutlar.analiz_esigi(f"{only100}.IS", "bist"), 72)
+        self.assertEqual(komutlar.analiz_esigi("ISGYO.IS", "gyo"), 80)
+        self.assertEqual(komutlar.analiz_esigi("AAPL", "hisse"), 75)
+
+    def test_message_in_bot_format(self):
+        df = daily_bars()
+        msg = komutlar.analiz_text("THYAO.IS", "$THYAO (BIST 30)", "bist", fetch=lambda s: {s: df})
+        lines = msg.splitlines()
+        # kanal formatı: $KOD · boş · giriş · boş · kademeler · boş · stop  (+ imza)
+        self.assertEqual(lines[0], "$THYAO")
+        self.assertRegex(lines[2], r"^[\d.]+-[\d.]+ giriş sağlayacağım$")
+        self.assertRegex(lines[4], r"^Kademelerim:[\d.]+-[\d.]+-[\d.]+-[\d.]+-[\d.]+\+\+$")
+        self.assertRegex(lines[6], r"^Stopum:[\d.]+ altı$")
+        self.assertEqual(lines[-1], "(Furkanla Katla)")
+        self.assertLessEqual(len(lines), 11)
+        down = komutlar.analiz_text("XYZ.IS", "$XYZ", "bist", fetch=lambda s: {s: daily_bars(drift=-0.003)})
+        self.assertIn("⚠️ Zayıf: bot bu hisseye sinyal vermezdi", down)
+        self.assertIsNone(komutlar.analiz_text("YOK.IS", "$YOK", "bist", fetch=lambda s: {}))
+        short = komutlar.analiz_text("NEW.IS", "$NEW", "bist", fetch=lambda s: {s: daily_bars(n=40)})
+        self.assertIn("yeterli geçmiş yok", short)
+
+    def test_handler_falls_back_to_us(self):
+        now = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        calls = []
+
+        def fake(sym, disp, cls, fetch=None):
+            calls.append(sym)
+            return None if sym.endswith(".IS") else f"OK {sym}"
+        with mock.patch.object(komutlar, "analiz_text", side_effect=fake):
+            h = live_alerts.command_handlers(now, ["us"], {}, {})
+            self.assertEqual(h["analiz"](["SMCI"]), "OK SMCI")
+            self.assertEqual(calls, ["SMCI.IS", "SMCI"])
+            self.assertIn("Kullanım", h["analiz"]([]))
+        self.assertEqual(komutlar.parse_command(
+            {"update_id": 1, "message": {"chat": {"id": -100}, "text": "/seviye thyao"}}, "-100"), ("analiz", ["thyao"]))
+
+
+KAP_PAGE = (
+    "<html><body><h1>MAVİ GİYİM SANAYİ VE TİCARET A.Ş.</h1><div>Geri Alınan Paylara İlişkin Bildirim</div>"
+    "<table><tr><td>İşleme Konu Pay</td><td>İşlem Tarihi</td><td>İşleme Konu Payların Nominal Tutarı (TL)</td>"
+    "<td>Sermayeye Oranı (%)</td><td>İşlem Fiyatı (TL/Adet)</td><td>Varsa Bu Paylara Bağlı İmtiyazlar</td></tr>"
+    "<tr><td>B Grubu, MAVI, TREMAVI00037</td><td>25.09.2026</td><td>200.000</td><td>0,02517</td>"
+    "<td>37,41</td><td></td></tr></table>"
+    "<div>Yönetim Kurulu Karar Tarihi 18.09.2026 · ISIN TREMAVI00037</div></body></html>")
+
+
+class TestGeriAlim(unittest.TestCase):
+    def test_numbers(self):
+        self.assertEqual(geri_alim.tr_num("4.100.050"), 4100050)
+        self.assertEqual(geri_alim.tr_num("37,41"), 37.41)
+        self.assertEqual(geri_alim.tr_num("200.000,00"), 200000.0)
+        self.assertEqual(geri_alim.tr_num("0,02517"), 0.02517)
+        self.assertEqual(geri_alim.tr_num("37.41"), 37.41)
+
+    def test_parse_kap_table(self):
+        rows = geri_alim.parse_rows(geri_alim.page_text(KAP_PAGE))
+        self.assertEqual(rows, [{"tarih": "2026-09-25", "lot": 200000.0, "fiyat": 37.41, "yaklasik": False}])
+
+    def test_parse_range_multi_rows_and_column_order(self):
+        text = ("İşleme Konu Pay İşlem Tarihi Nominal Tutar Sermayeye Oranı İşlem Fiyatı "
+                "DAGI, TREDAGI00018 25.09.2026 4.100.050 0,4 5,31-5,68 "
+                "DAGI, TREDAGI00018 24.09.2026 1.000.000 0,1 5,20")
+        rows = geri_alim.parse_rows(text)
+        self.assertEqual([r["lot"] for r in rows], [4100050, 1000000])
+        self.assertAlmostEqual(rows[0]["fiyat"], 5.495)
+        self.assertTrue(rows[0]["yaklasik"])
+        alt = "Pay Tarih Nominal İşlem Fiyatı Sermayeye Oranı X, TRAXXXX00011 25.09.2026 10.000 12,50 0,01"
+        self.assertEqual(geri_alim.parse_rows(alt)[0]["fiyat"], 12.5)
+        self.assertEqual(geri_alim.parse_rows("ISIN TREMAVI00037 açıklama metni"), [])
+
+    def test_collect_and_message(self):
+        from bot import universe as u
+        b30 = u.BIST30[0]
+        now = datetime(2026, 9, 25, 21, 0, tzinfo=ZoneInfo("Europe/Istanbul"))
+        items = [
+            {"disclosureIndex": 11, "subject": "Geri Alınan Paylara İlişkin Bildirim", "relatedStocks": b30,
+             "kapTitle": "BIST30 A.Ş."},
+            {"disclosureIndex": 12, "subject": "Geri Alınan Paylara İlişkin Bildirim", "relatedStocks": "DAGI"},
+            {"disclosureIndex": 13, "subject": "Özel Durum Açıklaması (Genel)", "summary": "Pay geri alım programı",
+             "relatedStocks": "XYZ"},
+            {"disclosureIndex": 14, "subject": "Geri Alınan Paylara İlişkin Bildirim", "relatedStocks": "OKUNMAZ"},
+            {"disclosureIndex": 15, "subject": "Finansal Rapor", "relatedStocks": "ABC"},
+            {"disclosureIndex": 10, "subject": "Geri Alınan Paylara İlişkin Bildirim", "relatedStocks": "ESKI"},
+        ]
+        pages = {"11": f"{b30}, TRE{b30[:4]}00011 25.09.2026 365.000 0,01 62,10",
+                 "12": "DAGI, TREDAGI00018 25.09.2026 4.100.050 0,4 5,31-5,68",
+                 "13": "Program duyurusu, tablo yok", "14": ""}
+        seen = {"10": "2026-09-24"}
+        entries = geri_alim.collect(now, seen, list_fn=lambda n, since=None: items,
+                                    page_fn=lambda i: pages.get(i, ""), pause=0)
+        self.assertEqual([e["no"] for e in entries], ["11", "12", "14"])     # program duyurusu ve eski yok
+        self.assertEqual(set(seen), {"10", "11", "12", "13", "14"})
+        self.assertAlmostEqual(entries[0]["tutar"], 365000 * 62.10)
+        msg = geri_alim.message(entries, "2026-09-25")
+        lines = msg.splitlines()
+        self.assertEqual(lines[0], "🔁 GERİ ALIMLAR — 25.09")
+        self.assertEqual(lines[2], f"${b30} ⭐BIST 30 · 365 bin lot · 22,7 mn TL")   # BIST 30 önce
+        self.assertEqual(lines[3], "$DAGI · 4,1 mn lot · ≈22,5 mn TL")
+        self.assertIn("Tutar okunamadı: OKUNMAZ", msg)
+        self.assertIn("Toplam ≈ 45,2 mn TL", msg)
+        self.assertLessEqual(len(lines), 10)
+        self.assertIsNone(geri_alim.message([], "2026-09-25"))
+
+    def test_daily_schedule_background(self):
+        tr = ZoneInfo("Europe/Istanbul")
+        job = live_alerts.CalendarJob(label="Geri alım özeti")
+        extra, send = {}, mock.Mock()
+        entry = {"no": "11", "kodlar": ["DAGI"], "sirket": "", "lot": 10.0, "tutar": 50.0, "ort": 5.0,
+                 "yaklasik": False, "tarihler": ["2026-09-25"], "okundu": True}
+
+        def fake_collect(now_tr, seen, since=None):
+            seen["11"] = "2026-09-25"
+            return [entry]
+        with mock.patch.dict(os.environ, {"GERI_ALIM": "1"}), \
+                mock.patch.object(geri_alim, "collect", side_effect=fake_collect):
+            early = datetime(2026, 9, 25, 20, 0, tzinfo=tr)
+            live_alerts.buyback_tasks(early, early, "2026-09-25", extra, send, 0.0, job=job)
+            self.assertFalse(job.running() or job.result)                  # 21:00'dan önce başlamaz
+            now = datetime(2026, 9, 25, 21, 5, tzinfo=tr)
+            live_alerts.buyback_tasks(now, now, "2026-09-25", extra, send, 0.0, job=job)
+            job.thread.join(2)
+            live_alerts.buyback_tasks(now, now, "2026-09-25", extra, send, 0.0, job=job)
+            live_alerts.buyback_tasks(now, now, "2026-09-25", extra, send, 0.0, job=job)
+        send.assert_called_once()
+        self.assertIn("GERİ ALIMLAR", send.call_args[0][0])
+        self.assertEqual(extra["geri_alim_date"], "2026-09-25")
+        self.assertEqual(extra["geri_alim_seen"], {"11": "2026-09-25"})
+        h = live_alerts.command_handlers(now, ["bist"], {}, extra)
+        self.assertIn("GERİ ALIMLAR", h["geri"]([]))
+        self.assertIn("21:00", live_alerts.command_handlers(now, ["bist"], {}, {})["geri"]([]))
+        sat = datetime(2026, 9, 26, 21, 30, tzinfo=tr)                      # cumartesi: çalışmaz
+        live_alerts.buyback_tasks(sat, sat, "2026-09-26", {}, send, 0.0, job=job)
+        self.assertFalse(job.running())
 
 
 if __name__ == "__main__":

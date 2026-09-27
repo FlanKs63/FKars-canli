@@ -196,9 +196,10 @@ class Cooldown:
         self.last: dict[str, tuple[datetime, float]] = {}
         self.sent_times: list[datetime] = []
 
-    def allow(self, symbol: str, price: float, now: datetime) -> bool:
+    def allow(self, symbol: str, price: float, now: datetime, reserve: int = 0) -> bool:
+        """reserve: saatlik sınırın bu kadarı başkasına (BIST 100/30 alarmlarına) ayrılmış; bu sembol kullanamaz."""
         self.sent_times = [t for t in self.sent_times if (now - t).total_seconds() < 3600]
-        if len(self.sent_times) >= self.max_per_hour:
+        if len(self.sent_times) >= self.max_per_hour - max(reserve, 0):
             return False
         prev = self.last.get(symbol)
         if prev is None:
